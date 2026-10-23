@@ -1,0 +1,4 @@
+# Minimal, free dependencies for HTML parsing and HTTP requests on GitHub-hosted Ubuntu runners.
+# Note: main.py also includes a full Python standard-library fallback (urllib.request + html.parser).
+requests>=2.32.3,<3.0.0
+beautifulsoup4>=4.12.3,<5.0.0
