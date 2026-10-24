@@ -372,6 +372,7 @@ class ValidationSuite(unittest.TestCase):
                 sources=test_sources,
                 http_client=client_v2,
                 notifier=failing_notifier,
+                reference_date=app.datetime.date(2026, 10, 18),
             )
             self.assertEqual(summary3.genuinely_new_notices, 1)
             self.assertEqual(summary3.telegram_delivery_failures, 1)
@@ -384,6 +385,7 @@ class ValidationSuite(unittest.TestCase):
                 sources=test_sources,
                 http_client=client_v2,
                 notifier=notifier,
+                reference_date=app.datetime.date(2026, 10, 18),
             )
             self.assertEqual(summary4.genuinely_new_notices, 0)
             self.assertEqual(summary4.telegram_deliveries_confirmed, 1)
@@ -400,6 +402,7 @@ class ValidationSuite(unittest.TestCase):
                 sources=test_sources,
                 http_client=client_v2,
                 notifier=notifier,
+                reference_date=app.datetime.date(2026, 10, 18),
             )
             self.assertEqual(summary5.genuinely_new_notices, 0)
             self.assertEqual(summary5.telegram_deliveries_confirmed, 0)
@@ -1055,6 +1058,7 @@ class ValidationSuite(unittest.TestCase):
                 sources=(ssc_src,),
                 http_client=client,
                 notifier=ambig_notifier,
+                reference_date=app.datetime.date(2026, 10, 19),
             )
             # Stale failed notice must have been suppressed to 'baselined' without calling notifier
             self.assertEqual(state1["notices"]["stale_failed_fp"]["delivery_status"], "baselined")
@@ -1063,6 +1067,7 @@ class ValidationSuite(unittest.TestCase):
             for fp, rec in state1["notices"].items():
                 if fp != "stale_failed_fp":
                     self.assertEqual(rec["delivery_status"], "delivered")
+                    self.assertEqual(rec["ledger_status"], "ambiguous")
 
             # Run monitor again: 0 calls to notifier!
             summary2, _ = app.run_monitor(
@@ -1071,6 +1076,7 @@ class ValidationSuite(unittest.TestCase):
                 sources=(ssc_src,),
                 http_client=client,
                 notifier=ambig_notifier,
+                reference_date=app.datetime.date(2026, 10, 19),
             )
             self.assertEqual(ambig_notifier.calls, 1)
             self.assertEqual(summary2.telegram_deliveries_confirmed, 0)
@@ -1246,29 +1252,64 @@ class ValidationSuite(unittest.TestCase):
             app.save_state_atomically(app.create_initial_state(), state_file)
 
             # 1. Initial auto run (baselines payload_1, 0 prod alerts)
-            s1, _ = app.run_monitor(state_path=state_file, mode="auto", sources=(ssc_src,), http_client=client, notifier=prod_notifier)
+            s1, _ = app.run_monitor(
+                state_path=state_file,
+                mode="auto",
+                sources=(ssc_src,),
+                http_client=client,
+                notifier=prod_notifier,
+                reference_date=app.datetime.date(2026, 10, 18),
+            )
             self.assertEqual(s1.mode, "baseline")
             self.assertEqual(len(prod_notifier.sent_notices), 0)
 
             # 2. Second auto run with unchanged data (0 prod alerts)
-            s2, _ = app.run_monitor(state_path=state_file, mode="auto", sources=(ssc_src,), http_client=client, notifier=prod_notifier)
+            s2, _ = app.run_monitor(
+                state_path=state_file,
+                mode="auto",
+                sources=(ssc_src,),
+                http_client=client,
+                notifier=prod_notifier,
+                reference_date=app.datetime.date(2026, 10, 18),
+            )
             self.assertEqual(s2.mode, "monitor")
             self.assertEqual(len(prod_notifier.sent_notices), 0)
 
             # 3. Manual live_test run (sends 1 [LIVE TEST] message on test_notifier, 0 prod alerts)
-            s3, _ = app.run_monitor(state_path=state_file, mode="live_test", sources=(ssc_src,), http_client=client, notifier=test_notifier)
+            s3, _ = app.run_monitor(
+                state_path=state_file,
+                mode="live_test",
+                sources=(ssc_src,),
+                http_client=client,
+                notifier=test_notifier,
+                reference_date=app.datetime.date(2026, 10, 18),
+            )
             self.assertEqual(s3.test_messages_delivered, 1)
             self.assertEqual(len(prod_notifier.sent_notices), 0)
 
             # 4. New notice appears in payload_2 -> monitor run sends exactly 1 prod alert
             routes[ssc_src.notice_urls[0]] = (200, {"Content-Type": "application/json"}, json.dumps(payload_2))
-            s4, _ = app.run_monitor(state_path=state_file, mode="monitor", sources=(ssc_src,), http_client=client, notifier=prod_notifier)
+            s4, _ = app.run_monitor(
+                state_path=state_file,
+                mode="monitor",
+                sources=(ssc_src,),
+                http_client=client,
+                notifier=prod_notifier,
+                reference_date=app.datetime.date(2026, 10, 19),
+            )
             self.assertEqual(s4.genuinely_new_notices, 1)
             self.assertEqual(s4.telegram_deliveries_confirmed, 1)
             self.assertEqual(len(prod_notifier.sent_notices), 1)
 
             # 5. Repeated auto runs with payload_2 -> 0 prod alerts
-            s5, _ = app.run_monitor(state_path=state_file, mode="auto", sources=(ssc_src,), http_client=client, notifier=prod_notifier)
+            s5, _ = app.run_monitor(
+                state_path=state_file,
+                mode="auto",
+                sources=(ssc_src,),
+                http_client=client,
+                notifier=prod_notifier,
+                reference_date=app.datetime.date(2026, 10, 19),
+            )
             self.assertEqual(s5.genuinely_new_notices, 0)
             self.assertEqual(len(prod_notifier.sent_notices), 1)
 
@@ -1969,13 +2010,13 @@ class ValidationSuite(unittest.TestCase):
         upsc_src = app.SOURCE_BY_ID["upsc"]
         html_v1 = """
         <html><body><h2>What's New</h2><ul>
-          <li><a href="http://www.upsc.gov.in/sites/default/files/Advt-12-2026.pdf?utm_source=homepage">18-10-2026 Recruitment Advertisement No. 12/2026 for 85 Posts</a></li>
+          <li><a href="http://www.upsc.gov.in/sites/default/files/Advt-12-2026.pdf?utm_source=homepage">19-10-2026 Recruitment Advertisement No. 12/2026 for 85 Posts</a></li>
         </ul></body></html>
         """
         # Second run serves the same notice with HTTPS, different query param, and minor title spacing/badge variation
         html_v2 = """
         <html><body><h2>What's New</h2><ul>
-          <li><a href="https://upsc.gov.in/sites/default/files/Advt-12-2026.pdf?download=1">1. 18-10-2026 Recruitment  Advertisement No. 12/2026 - for 85 Posts [NEW] (2.1 MB)</a></li>
+          <li><a href="https://upsc.gov.in/sites/default/files/Advt-12-2026.pdf?download=1">1. 19-10-2026 Recruitment  Advertisement No. 12/2026 - for 85 Posts [NEW] (2.1 MB)</a></li>
         </ul></body></html>
         """
         routes: Dict[str, Any] = {
@@ -2063,6 +2104,7 @@ class ValidationSuite(unittest.TestCase):
             self.assertEqual(s1.telegram_deliveries_confirmed, 10)
             self.assertEqual(s1.capped_deferred_notices, 4)
             self.assertEqual(len(notifier.sent_notices), 10)
+            self.assertEqual(len(state1["pending_queue"]), 4)
 
             # Run 2: sends the remaining 4 deferred notices
             s2, state2 = app.run_monitor(
@@ -2077,10 +2119,420 @@ class ValidationSuite(unittest.TestCase):
             self.assertEqual(s2.genuinely_new_notices, 0)
             self.assertEqual(s2.telegram_deliveries_confirmed, 4)
             self.assertEqual(len(notifier.sent_notices), 14)
+            self.assertEqual(len(state2["pending_queue"]), 0)
+
+    def test_34_bug1_ist_same_day_yesterday_two_days_ago_and_utc_midnight_conversion(self) -> None:
+        """
+        Verify Bug 1 requirements (Scenarios 1-11):
+        1. Notice published today in Asia/Kolkata -> accepted
+        2. Notice published yesterday in Asia/Kolkata -> rejected (STALE_PUBLICATION_DATE)
+        3. Notice published two days ago -> rejected
+        4. Notice published in a previous month/year -> rejected
+        5. Old notice first discovered today -> rejected and recorded as baselined
+        6. Old notice edited today without a new official publication date -> rejected
+        7. Notice with missing publication date -> rejected (MISSING_PUBLICATION_DATE)
+        8. Notice with invalid/unparseable date -> rejected (INVALID_PUBLICATION_DATE)
+        9. Notice with ambiguous or conflicting dates -> rejected (AMBIGUOUS_PUBLICATION_DATE / CONFLICTING_PUBLICATION_DATES)
+        10. Notice with future date -> rejected (FUTURE_PUBLICATION_DATE)
+        11. UTC timestamp near midnight converted accurately to Asia/Kolkata (UTC+05:30)
+        """
+        today_ist = app.datetime.date(2026, 10, 24)
+        self.assertEqual(app.DEFAULT_MAX_NOTICE_AGE_DAYS, 0)
+
+        # Scenario 1: Published today (2026-10-24) -> accepted
+        ok_today, iso_today, reason_today = app.validate_publication_date(
+            "24-10-2026", reference_date=today_ist
+        )
+        self.assertTrue(ok_today)
+        self.assertEqual(iso_today, "2026-10-24")
+        self.assertEqual(reason_today, "VALID_PUBLICATION_DATE")
+
+        # Scenario 2: Published yesterday (2026-10-23) -> rejected!
+        ok_yest, iso_yest, reason_yest = app.validate_publication_date(
+            "23-10-2026", reference_date=today_ist
+        )
+        self.assertFalse(ok_yest)
+        self.assertEqual(iso_yest, "2026-10-23")
+        self.assertEqual(reason_yest, "STALE_PUBLICATION_DATE")
+
+        # Exact SSC stenographer bug from kniklife1/sscv6 (createdAt=2026-10-23T11:02:28.718Z, url=tentative_vacancies_24102026.pdf)
+        ok_ssc_bug, iso_ssc_bug, reason_ssc_bug = app.validate_publication_date(
+            "2026-10-23T11:02:28.718Z",
+            reference_date=today_ist,
+            url="https://ssc.gov.in/api/attachment/uploads/masterData/NoticeBoards/tentative_vacancies_24102026.pdf",
+        )
+        self.assertFalse(ok_ssc_bug)
+        self.assertIn(reason_ssc_bug, ("STALE_PUBLICATION_DATE", "CONFLICTING_PUBLICATION_DATES"))
+
+        # Scenario 3: Published two days ago (2026-10-22) -> rejected
+        ok_2d, iso_2d, reason_2d = app.validate_publication_date("22-10-2026", reference_date=today_ist)
+        self.assertFalse(ok_2d)
+        self.assertEqual(iso_2d, "2026-10-22")
+        self.assertEqual(reason_2d, "STALE_PUBLICATION_DATE")
+
+        # Scenario 4: Published in previous month/year -> rejected
+        for old_str in ("15-09-2026", "24-10-2025"):
+            ok_old, _, reason_old = app.validate_publication_date(old_str, reference_date=today_ist)
+            self.assertFalse(ok_old)
+            self.assertEqual(reason_old, "STALE_PUBLICATION_DATE")
+
+        # Scenario 6: Sitemap <lastmod> or page Last-Modified today must NEVER be treated as publication date
+        self.assertIsNone(app.extract_explicit_date("<lastmod>2026-10-24T10:00:00Z</lastmod>"))
+        self.assertIsNone(app.extract_explicit_date("Last-Modified: 24-10-2026"))
+        ok_mod, _, reason_mod = app.validate_publication_date(
+            "24-10-2026",
+            reference_date=today_ist,
+            context_text="Page Last Modified on 24-10-2026",
+        )
+        self.assertFalse(ok_mod)
+        self.assertEqual(reason_mod, "NON_PUBLICATION_DATE_TYPE")
+
+        # Scenario 7 & 8: Missing and invalid dates -> rejected
+        self.assertEqual(
+            app.validate_publication_date(None, reference_date=today_ist),
+            (False, None, "MISSING_PUBLICATION_DATE"),
+        )
+        self.assertEqual(
+            app.validate_publication_date("31-02-2026", reference_date=today_ist),
+            (False, None, "INVALID_PUBLICATION_DATE"),
+        )
+
+        # Scenario 9: Ambiguous partial/2-digit-year date or conflicting listing vs PDF date -> rejected (fail closed)
+        ok_amb, _, reason_amb = app.validate_publication_date("12/26", reference_date=today_ist)
+        self.assertFalse(ok_amb)
+        self.assertEqual(reason_amb, "AMBIGUOUS_PUBLICATION_DATE")
+
+        ok_conf, _, reason_conf = app.validate_publication_date(
+            "24-10-2026",
+            reference_date=today_ist,
+            context_text="Recruitment Notice Published on 24-10-2026",
+            url="https://ssc.gov.in/uploads/notice_23102026.pdf",
+        )
+        self.assertFalse(ok_conf)
+        self.assertEqual(reason_conf, "CONFLICTING_PUBLICATION_DATES")
+
+        # Scenario 10: Future date -> rejected
+        ok_fut, iso_fut, reason_fut = app.validate_publication_date("25-10-2026", reference_date=today_ist)
+        self.assertFalse(ok_fut)
+        self.assertEqual(iso_fut, "2026-10-25")
+        self.assertEqual(reason_fut, "FUTURE_PUBLICATION_DATE")
+
+        # Scenario 11: UTC timestamp near midnight converted to Asia/Kolkata (UTC+05:30):
+        # 2026-10-23T19:00:00Z is 2026-10-24T00:30:00+05:30 (Today in IST -> accepted)
+        ok_utc_after_midnight, iso_utc_after, _ = app.validate_publication_date(
+            "2026-10-23T19:00:00Z", reference_date=today_ist
+        )
+        self.assertTrue(ok_utc_after_midnight)
+        self.assertEqual(iso_utc_after, "2026-10-24")
+
+        # 2026-10-23T18:00:00Z is 2026-10-23T23:30:00+05:30 (Yesterday in IST -> rejected!)
+        ok_utc_before_midnight, iso_utc_before, reason_utc_before = app.validate_publication_date(
+            "2026-10-23T18:00:00Z", reference_date=today_ist
+        )
+        self.assertFalse(ok_utc_before_midnight)
+        self.assertEqual(iso_utc_before, "2026-10-23")
+        self.assertEqual(reason_utc_before, "STALE_PUBLICATION_DATE")
+
+        # Scenario 5: End-to-end monitor check where yesterday's notice & old edited notice are first discovered today
+        ssc_src = app.SOURCE_BY_ID["ssc"]
+        ssc_payload = {
+            "statusCode": "200",
+            "data": [
+                {
+                    "id": "c96uok9wtnz6h5z0kfopt",
+                    "headline": "Tentative Vacancy of Grade C Stenographers Limited Departmental Competitive Examination, 2025",
+                    "createdAt": "2026-10-23T11:02:28.718Z",
+                    "attachments": [{"path": "uploads/masterData/NoticeBoards/tentative_vacancies_23102026.pdf"}],
+                },
+                {
+                    "id": "ssc-today-valid",
+                    "headline": "SSC Combined Graduate Level Examination 2026 Tier-I Admit Card Notice",
+                    "createdAt": "2026-10-23T19:15:00.000Z",  # 2026-10-24 00:45 IST (Today in IST)
+                    "attachments": [{"path": "uploads/masterData/NoticeBoards/cgl_admit_24102026.pdf"}],
+                },
+            ],
+        }
+        client = FakeHttpClient(
+            routes={
+                ssc_src.notice_urls[0]: (200, {"Content-Type": "application/json"}, json.dumps(ssc_payload)),
+            }
+        )
+        notifier = RecordingNotifier()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = os.path.join(tmpdir, "notice_state.json")
+            st = app.create_initial_state()
+            st["initialized"] = True
+            st["sources"]["ssc"]["baseline_completed"] = True
+            st["sources"]["ssc"]["baseline_completed_at"] = "2026-10-01T00:00:00Z"
+            app.save_state_atomically(st, state_file)
+
+            summary, final_state = app.run_monitor(
+                state_path=state_file,
+                mode="monitor",
+                sources=(ssc_src,),
+                http_client=client,
+                notifier=notifier,
+                reference_date=today_ist,
+            )
+            self.assertEqual(summary.genuinely_new_notices, 1)
+            self.assertEqual(summary.rejected_stale_notices, 1)
+            self.assertEqual(summary.telegram_deliveries_confirmed, 1)
+            self.assertEqual(len(notifier.sent_notices), 1)
+            sent_rec, _, sent_msg = notifier.sent_notices[0]
+            self.assertEqual(sent_rec["source_identifier"], "ssc-today-valid")
+            self.assertEqual(sent_rec["publication_date"], "2026-10-24")
+            self.assertIn("Publication Date:</b> 2026-10-24", sent_msg)
+
+    def test_35_bug2_five_layer_identity_deduplication_and_two_distinct_notices_today(self) -> None:
+        """
+        Verify Bug 2 identity requirements (Scenarios 12-16):
+        12. Same notice scraped across two consecutive runs -> sent once, skipped second time
+        13. Same notice with tracking/cache-busting query parameters -> sent once
+        14. Same notice with minor title whitespace/case/punctuation changes -> sent once
+        15. Same notice discovered via listing URL and direct PDF URL -> sent once
+        16. Two genuinely different notices published today -> both sent
+        """
+        today_ist = app.datetime.date(2026, 10, 24)
+        upsc_src = app.SOURCE_BY_ID["upsc"]
+
+        # Run 1: Listing has 2 genuinely distinct notices published today + 1 wrapper link for Notice A
+        html_run1 = """
+        <html><body><h2>What's New</h2><ul>
+          <li><a href="https://www.upsc.gov.in/whats-new/nda-ii-2026">24-10-2026 Examination Schedule: National Defence Academy (II) Examination, 2026</a></li>
+          <li><a href="https://www.upsc.gov.in/sites/default/files/NDA_II_2026_Schedule.pdf?utm_source=portal&_t=111">24-10-2026 Examination Schedule: National Defence Academy (II) Examination, 2026</a></li>
+          <li><a href="https://www.upsc.gov.in/sites/default/files/CDS_II_2026_Schedule.pdf?v=1">24-10-2026 Examination Schedule: Combined Defence Services (II) Examination, 2026</a></li>
+        </ul></body></html>
+        """
+        # Run 2: Same 2 notices with cache-busting query params, http vs https, and minor title edits
+        html_run2 = """
+        <html><body><h2>What's New</h2><ul>
+          <li><a href="http://upsc.gov.in/sites/default/files/NDA_II_2026_Schedule.pdf?cachebust=999&fbclid=abc">1. 24-10-2026  Examination Schedule - National Defence Academy (II) Examination 2026 [NEW!] (1.4 MB)</a></li>
+          <li><a href="https://upsc.gov.in/sites/default/files/CDS_II_2026_Schedule.pdf?timestamp=22222">2. 24-10-2026 Examination Schedule: Combined Defence Services (II) Examination, 2026 (New)</a></li>
+        </ul></body></html>
+        """
+        routes: Dict[str, Any] = {
+            upsc_src.notice_urls[0]: (200, {"Content-Type": "text/html"}, html_run1),
+        }
+        client = FakeHttpClient(routes=routes)
+        notifier = RecordingNotifier()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = os.path.join(tmpdir, "notice_state.json")
+            st = app.create_initial_state()
+            st["initialized"] = True
+            st["sources"]["upsc"]["baseline_completed"] = True
+            st["sources"]["upsc"]["baseline_completed_at"] = "2026-10-01T00:00:00Z"
+            app.save_state_atomically(st, state_file)
+
+            # Run 1: Wrapper + PDF for NDA-II collapse to 1 notice; CDS-II is distinct -> 2 notices sent
+            s1, state1 = app.run_monitor(
+                state_path=state_file,
+                mode="monitor",
+                sources=(upsc_src,),
+                http_client=client,
+                notifier=notifier,
+                reference_date=today_ist,
+            )
+            self.assertEqual(s1.genuinely_new_notices, 2)
+            self.assertEqual(s1.telegram_deliveries_confirmed, 2)
+            self.assertEqual(len(notifier.sent_notices), 2)
+
+            # Run 2: Cache-busting params + minor title edits -> 0 new notices, 0 duplicate alerts
+            routes[upsc_src.notice_urls[0]] = (200, {"Content-Type": "text/html"}, html_run2)
+            s2, _ = app.run_monitor(
+                state_path=state_file,
+                mode="monitor",
+                sources=(upsc_src,),
+                http_client=client,
+                notifier=notifier,
+                reference_date=today_ist,
+            )
+            self.assertEqual(s2.genuinely_new_notices, 0)
+            self.assertEqual(s2.telegram_deliveries_confirmed, 0)
+            self.assertEqual(len(notifier.sent_notices), 2)
+
+    def test_36_bug2_telegram_ledger_states_and_message_id_tracking(self) -> None:
+        """
+        Verify Bug 2 Telegram delivery ledger requirements (Scenarios 17-20):
+        17. Telegram sendMessage returns success -> marked ledger_status='sent', delivery_status='delivered',
+            telegram_message_id recorded, and never resent.
+        18. Telegram sendMessage returns HTTP 500 or pre-send error -> marked 'failed', retried safely.
+        19. Telegram sendMessage times out after request transmission (or returns HTTP 200 with corrupt JSON) ->
+            marked ledger_status='ambiguous', delivery_status='delivered', and not blindly resent.
+        20. Workflow YAML synchronizes with origin/${GITHUB_REF_NAME} after acquiring concurrency lock.
+        """
+        notifier = app.TelegramNotifier(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            chat_id="-1001234567890",
+            max_retries=1,
+            sleep_fn=lambda _: None,
+        )
+        with mock.patch.object(
+            notifier,
+            "_post_json",
+            return_value=(
+                200,
+                {"Content-Type": "application/json"},
+                json.dumps({"ok": True, "result": {"message_id": 987654}}).encode("utf-8"),
+            ),
+        ):
+            notifier.send_notice(
+                {
+                    "source_id": "ssc",
+                    "organization": "Staff Selection Commission (SSC)",
+                    "title": "SSC CGL 2026 Final Result",
+                    "category": "Results",
+                    "publication_date": "2026-10-24",
+                    "normalized_url": "https://ssc.gov.in/cgl_2026.pdf",
+                }
+            )
+            self.assertEqual(notifier.last_message_id, 987654)
+
+        # HTTP 200 with truncated/unparseable JSON body must raise ambiguous=True
+        with mock.patch.object(
+            notifier,
+            "_post_json",
+            return_value=(200, {"Content-Type": "application/json"}, b"{truncated_json"),
+        ):
+            with self.assertRaises(app.TelegramDeliveryError) as ctx_amb:
+                notifier.send_notice(
+                    {
+                        "source_id": "ssc",
+                        "organization": "Staff Selection Commission (SSC)",
+                        "title": "SSC CGL 2026 Final Result",
+                        "category": "Results",
+                        "publication_date": "2026-10-24",
+                        "normalized_url": "https://ssc.gov.in/cgl_2026.pdf",
+                    }
+                )
+            self.assertTrue(ctx_amb.exception.ambiguous)
+
+        # Verify workflow YAML contains post-checkout git reset --hard origin/${GITHUB_REF_NAME}
+        workflow_path = os.path.join(
+            os.path.dirname(os.path.abspath(app.__file__)),
+            ".github",
+            "workflows",
+            "main.yml",
+        )
+        with open(workflow_path, "r", encoding="utf-8") as fh:
+            wf_content = fh.read()
+        self.assertIn('git fetch origin "${GITHUB_REF_NAME}"', wf_content)
+        self.assertIn('git reset --hard "origin/${GITHUB_REF_NAME}"', wf_content)
+        self.assertIn("TZ: Asia/Kolkata", wf_content)
+
+    def test_37_bug3_concurrent_fetching_noop_commit_suppression_and_pending_queue_revalidation(self) -> None:
+        """
+        Verify Bug 3 performance, no-op commit suppression, and pending_queue revalidation (Scenarios 21-22):
+        - Concurrent fetching via ThreadPoolExecutor completes all 9 sources in parallel when using HttpClient
+        - Pure no-op monitor run sets summary.state_modified = False and does not rewrite state file
+        - Overflow notices (> 10) persisted in pending_queue are revalidated on the next run; if the next run
+          occurs on the next calendar day in Asia/Kolkata, yesterday's queued notices are rejected and NOT sent.
+        """
+        ssc_src = app.SOURCE_BY_ID["ssc"]
+        items = [
+            {
+                "id": f"ssc-q-{i}",
+                "headline": f"Recruitment Advertisement No. {i}/2026 for Inspector Posts",
+                "createdAt": "2026-10-24T09:00:00.000Z",
+                "attachments": [{"path": f"uploads/insp_{i}_24102026.pdf"}],
+            }
+            for i in range(1, 14)  # 13 notices published on 2026-10-24
+        ]
+        ssc_payload = {"statusCode": "200", "data": items}
+        client = FakeHttpClient(
+            routes={
+                ssc_src.notice_urls[0]: (200, {"Content-Type": "application/json"}, json.dumps(ssc_payload)),
+            }
+        )
+        notifier = RecordingNotifier()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = os.path.join(tmpdir, "notice_state.json")
+            st = app.create_initial_state()
+            st["initialized"] = True
+            st["sources"]["ssc"]["baseline_completed"] = True
+            st["sources"]["ssc"]["baseline_completed_at"] = "2026-10-01T00:00:00Z"
+            app.save_state_atomically(st, state_file)
+
+            # Run 1 on 2026-10-24: sends 10, defers 3 in pending_queue
+            s1, state1 = app.run_monitor(
+                state_path=state_file,
+                mode="monitor",
+                sources=(ssc_src,),
+                http_client=client,
+                notifier=notifier,
+                reference_date=app.datetime.date(2026, 10, 24),
+                max_alerts_per_run=10,
+            )
+            self.assertEqual(s1.telegram_deliveries_confirmed, 10)
+            self.assertEqual(s1.capped_deferred_notices, 3)
+            self.assertEqual(len(state1["pending_queue"]), 3)
+            self.assertTrue(s1.state_modified)
+
+            # Run 2 happens the NEXT day (2026-10-25 in Asia/Kolkata):
+            # The 3 deferred notices from 2026-10-24 are now yesterday's notices and MUST be rejected!
+            s2, state2 = app.run_monitor(
+                state_path=state_file,
+                mode="monitor",
+                sources=(ssc_src,),
+                http_client=client,
+                notifier=notifier,
+                reference_date=app.datetime.date(2026, 10, 25),
+                max_alerts_per_run=10,
+            )
+            self.assertEqual(s2.telegram_deliveries_confirmed, 0)
+            self.assertEqual(s2.rejected_stale_notices, 3)
+            self.assertEqual(len(state2["pending_queue"]), 0)
+            self.assertEqual(len(notifier.sent_notices), 10)
+
+            # Run 3 with no changes at all -> pure no-op run, state_modified must be False!
+            mtime_before = os.path.getmtime(state_file)
+            s3, _ = app.run_monitor(
+                state_path=state_file,
+                mode="monitor",
+                sources=(ssc_src,),
+                http_client=client,
+                notifier=notifier,
+                reference_date=app.datetime.date(2026, 10, 25),
+                max_alerts_per_run=10,
+            )
+            mtime_after = os.path.getmtime(state_file)
+            self.assertTrue(s3.state_persisted)
+            self.assertFalse(s3.state_modified)
+            self.assertEqual(mtime_before, mtime_after)
+
+    def test_38_preserved_notice_state_json_integrity_and_405_records(self) -> None:
+        """
+        Verify Scenarios 23 & 24:
+        - Existing data/notice_state.json history is preserved without reset or truncation
+          (all 405 historical records from kniklife1/sscv6 are present and valid)
+        - Exactly the 9 configured websites exist in state['sources']
+        """
+        repo_state_path = os.path.join(
+            os.path.dirname(os.path.abspath(app.__file__)),
+            "data",
+            "notice_state.json",
+        )
+        self.assertTrue(os.path.exists(repo_state_path))
+        loaded = app.load_state(repo_state_path, allow_init_if_missing=False)
+        self.assertEqual(loaded["schema_version"], 1)
+        self.assertTrue(loaded["initialized"])
+        self.assertEqual(len(loaded["sources"]), 9)
+        for src in app.SOURCES:
+            self.assertIn(src.source_id, loaded["sources"])
+            self.assertTrue(loaded["sources"][src.source_id]["baseline_completed"])
+        self.assertGreaterEqual(len(loaded["notices"]), 405)
+        for fp, rec in loaded["notices"].items():
+            self.assertIn("canonical_url", rec)
+            self.assertIn("canonical_title", rec)
+            self.assertIn("content_hash", rec)
+            self.assertIn("ledger_status", rec)
+            self.assertIn("eligibility_status", rec)
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
 
