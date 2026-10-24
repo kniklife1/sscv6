@@ -9,6 +9,7 @@ live_test verification mode, and Git-tracked JSON state persistence.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
 import dataclasses
 import datetime
@@ -31,6 +32,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo  # type: ignore
+    IST_TIMEZONE: datetime.tzinfo = _ZoneInfo("Asia/Kolkata")
+except Exception:
+    IST_TIMEZONE = datetime.timezone(
+        datetime.timedelta(hours=5, minutes=30), name="Asia/Kolkata"
+    )
 
 # Optional third-party libraries (used when installed in GitHub Actions;
 # full standard-library fallback included for hermetic environments).
@@ -57,13 +66,16 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
-DEFAULT_TIMEOUT = (8, 12)  # (connect_timeout, read_timeout) in seconds
+DEFAULT_TIMEOUT = (6, 10)  # (connect_timeout, read_timeout) in seconds
 MAX_HTTP_RETRIES = 2
+MAX_SOURCE_CONCURRENCY = 9
+MAX_CONCURRENT_SOURCES = MAX_SOURCE_CONCURRENCY
 MAX_TELEGRAM_RETRIES = 3
 MAX_TELEGRAM_MESSAGE_LENGTH = 4000
 MAX_NOTICE_DELIVERY_ATTEMPTS = 3
 MAX_FAILED_RETRY_AGE_HOURS = 24
-DEFAULT_MAX_NOTICE_AGE_DAYS = int(os.environ.get("MAX_NOTICE_AGE_DAYS", "30") or "30")
+# Strict same-day Asia/Kolkata freshness: 0 means only notices published TODAY in Asia/Kolkata are eligible.
+DEFAULT_MAX_NOTICE_AGE_DAYS = int(os.environ.get("MAX_NOTICE_AGE_DAYS", "0") or "0")
 MAX_NEW_NOTICE_AGE_DAYS = DEFAULT_MAX_NOTICE_AGE_DAYS
 MAX_PRODUCTION_ALERTS_PER_RUN = int(os.environ.get("MAX_ALERTS_PER_RUN", "10") or "10")
 MAX_FULL_NOTICE_RECORDS = 2500
@@ -94,6 +106,18 @@ TRACKING_QUERY_PARAMS: Set[str] = {
     "random",
     "_",
     "cb",
+    "v",
+    "ver",
+    "version",
+    "t",
+    "ts",
+    "time",
+    "_t",
+    "cache",
+    "refresh",
+    "download",
+    "ref",
+    "source",
 }
 
 REVIEW_REQUIRED_ERROR_CATEGORIES: Set[str] = {
@@ -105,6 +129,35 @@ REVIEW_REQUIRED_ERROR_CATEGORIES: Set[str] = {
     "HTML_PARSE_ERROR",
     "HTTP_404_NOT_FOUND",
 }
+
+
+def ist_now() -> datetime.datetime:
+    """Returns the current timezone-aware datetime in Asia/Kolkata (IST, UTC+05:30)."""
+    return datetime.datetime.now(IST_TIMEZONE)
+
+
+def ist_now_iso() -> str:
+    """Returns the current Asia/Kolkata timestamp formatted in ISO-8601 with +05:30 offset."""
+    return ist_now().strftime("%Y-%m-%dT%H:%M:%S+05:30")
+
+
+def ist_today(reference_date: Optional[Any] = None) -> datetime.date:
+    """
+    Returns the reference calendar date in Asia/Kolkata:
+    - If reference_date is a timezone-aware datetime, converts it to Asia/Kolkata first.
+    - If reference_date is a naive datetime, returns its .date().
+    - If reference_date is a datetime.date, returns it directly.
+    - If reference_date is None, returns today's calendar date in Asia/Kolkata.
+    """
+    if reference_date is None:
+        return ist_now().date()
+    if isinstance(reference_date, datetime.datetime):
+        if reference_date.tzinfo is not None:
+            return reference_date.astimezone(IST_TIMEZONE).date()
+        return reference_date.date()
+    if isinstance(reference_date, datetime.date):
+        return reference_date
+    raise TypeError(f"Unsupported reference_date type: {type(reference_date)!r}")
 
 
 class StateValidationError(Exception):
@@ -162,6 +215,10 @@ class DiscoveredNotice:
     raw_context: str = ""
     normalized_url: str = ""
     normalized_title: str = ""
+    canonical_url: str = ""
+    canonical_pdf_url: Optional[str] = None
+    canonical_title: str = ""
+    content_hash: str = ""
     fingerprint: str = ""
 
     def __post_init__(self) -> None:
@@ -170,6 +227,19 @@ class DiscoveredNotice:
             self.normalized_url = normalize_url(self.url)
         if not self.normalized_title:
             self.normalized_title = normalize_title(self.title)
+        if not self.canonical_url:
+            self.canonical_url = canonical_url_key(self.normalized_url)
+        if self.canonical_pdf_url is None:
+            self.canonical_pdf_url = canonical_pdf_url_key(self.normalized_url)
+        if not self.canonical_title:
+            self.canonical_title = canonical_title_key(self.title)
+        if not self.content_hash:
+            self.content_hash = compute_content_hash(
+                self.source_id,
+                self.title,
+                self.normalized_url,
+                self.source_identifier,
+            )
         if not self.fingerprint:
             self.fingerprint = compute_fingerprint(
                 self.normalized_url, self.normalized_title
@@ -567,6 +637,54 @@ def canonical_title_key(title: str) -> str:
     text = re.sub(r"\be[-\s]*admit\s*card\b", "admit card", text)
     text = re.sub(r"[^a-z0-9\u0900-\u097f]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def canonical_pdf_url_key(url: str) -> Optional[str]:
+    """
+    Returns the canonical URL key when the URL points directly to an official
+    PDF/DOC/attachment document, or None for HTML listing/wrapper pages.
+    """
+    norm = normalize_url(url)
+    if not norm:
+        return None
+    lower = norm.lower()
+    if any(
+        tok in lower
+        for tok in (
+            ".pdf",
+            ".doc",
+            ".docx",
+            "open_pdf",
+            "view_enclosure",
+            "notificationdocview",
+            "/api/attachment/",
+            "/assets/document/",
+        )
+    ):
+        return canonical_url_key(norm)
+    return None
+
+
+def compute_content_hash(
+    source_id: str,
+    title: str,
+    url: str,
+    source_identifier: Optional[str] = None,
+) -> str:
+    """
+    Computes a layered content identity hash combining issuing source_id,
+    source_identifier (when present), canonical PDF/document token or URL key,
+    and canonical title key.
+    """
+    sid = (source_id or "").strip().lower()
+    s_ident = (source_identifier or "").strip().lower()
+    c_title = canonical_title_key(title)
+    norm_u = normalize_url(url)
+    c_pdf = canonical_pdf_url_key(norm_u) or ""
+    c_url = canonical_url_key(norm_u)
+    doc_part = s_ident or c_pdf or c_url
+    payload = f"{sid}|{doc_part}|{c_title}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 # ============================================================================
@@ -1079,20 +1197,25 @@ MONTH_NAME_MAP: Dict[str, int] = {
 
 # Clauses that represent expiry/application deadlines rather than publication dates
 EXPIRY_DATE_CLAUSE_RE = re.compile(
-    rf"\b(?:visible\s+up\s*to|valid\s+up\s*to|valid\s+till|last\s+date(?:\s+(?:for|of|to)\s+(?:apply|online\s+application|submission|registration|fee\s+payment))?|closing\s+date(?:\s+of\s+application)?|end\s+date|archive\s+on|apply\s+(?:online\s+)?(?:up\s*to|till|before|by))\s*[:.-]?\s*({SingleDateTokenPattern})",
+    rf"(?:\b(?:visible\s+up\s*to|valid\s+up\s*to|valid\s+till|last\s+date(?:\s+(?:for|of|to)\s+(?:apply|online\s+application|submission|registration|fee\s+payment))?|closing\s+date(?:\s+of\s+application)?|end\s+date|archive\s+on|apply\s+(?:online\s+)?(?:up\s*to|till|before|by))|(?:अंतिम\s+तिथि))\s*[:.-]?\s*({SingleDateTokenPattern})",
     re.IGNORECASE,
 )
 
 # Clauses that represent application windows ("Apply Online from X to Y")
 APPLICATION_WINDOW_CLAUSE_RE = re.compile(
-    rf"\b(?:apply\s+online(?:\s+from|\s+between)?|online\s+application(?:s)?(?:\s+from|\s+starts?\s+on|\s+between)?|application\s+form(?:\s+from|\s+starts?\s+on)?|registration\s+(?:from|starts?\s+on|between))\s*[:.-]?\s*({SingleDateTokenPattern})(?:\s*(?:to|till|up\s*to|-)\s*({SingleDateTokenPattern}))?",
+    rf"(?:\b(?:apply\s+online(?:\s+from|\s+between)?|online\s+application(?:s)?(?:\s+from|\s+starts?\s+on|\s+between)?|application\s+form(?:\s+from|\s+starts?\s+on)?|registration\s+(?:from|starts?\s+on|between)|start(?:ing)?\s+date\s+of\s+application)|(?:आवेदन\s+पत्र\s+आरंभ\s+करने\s+की\s+तिथि))\s*[:.-]?\s*({SingleDateTokenPattern})(?:\s*(?:to|till|up\s*to|-|अंतिम\s+तिथि\s*[:.-]?)\s*({SingleDateTokenPattern}))?",
     re.IGNORECASE,
 )
 
-# Clauses that represent modified/updated/scraped timestamps rather than official publication dates
+# Clauses that represent modified/updated/scraped/lastmod timestamps rather than official publication dates
 MODIFIED_DATE_CLAUSE_RE = re.compile(
-    rf"\b(?:last\s+modified(?:\s+date|\s+on)?|modified\s+(?:date|on)|last\s+updated(?:\s+on)?|updated\s+on|page\s+updated\s+on|website\s+updated\s+on|scraped\s+on|fetched\s+on)\s*[:.-]?\s*({SingleDateTokenPattern})",
+    rf"\b(?:last[-\s]+modified(?:\s+date|\s+on)?|modified\s+(?:date|on)|last\s+updated(?:\s+on)?|updated\s+on|page\s+updated\s+on|website\s+updated\s+on|site\s+updated\s+on|content\s+updated\s+on|scraped\s+on|fetched\s+on|discovered\s+on|first_seen_at|lastmod)\s*[:.-]?\s*({SingleDateTokenPattern})",
     re.IGNORECASE,
+)
+
+SITEMAP_LASTMOD_TAG_RE = re.compile(
+    r"<\s*lastmod\b[^>]*>.*?<\s*/\s*lastmod\s*>",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # Clauses that represent examination / interview / PET / PST / DV event dates rather than publication dates
@@ -1100,6 +1223,76 @@ EXAM_DATE_CLAUSE_RE = re.compile(
     rf"\b(?:exam(?:ination)?\s+date|date\s+of\s+(?:written\s+|cbt\s+|main\s+|preliminary\s+|skill\s+|typing\s+)?(?:exam(?:ination)?|test|interview|dv|verification)|(?:written\s+|cbt\s+)?exam(?:ination)?\s+(?:will\s+be\s+|to\s+be\s+|is\s+)?(?:held|conducted|scheduled)\s+(?:on|from)|(?:to\s+be\s+|will\s+be\s+)(?:held|conducted)\s+(?:on|from)|scheduled\s+(?:to\s+be\s+held\s+)?(?:on|from)|(?:interview|skill\s+test|typing\s+test|dv|document\s+verification|pet\s*/?\s*pst|medical\s+examination)\s+(?:date|on|from|scheduled\s+on))\s*[:.-]?\s*({SingleDateTokenPattern})(?:\s*(?:to|till|-)\s*({SingleDateTokenPattern}))?",
     re.IGNORECASE,
 )
+
+# Explicit publication date labels inside context text used for conflict checks
+EXPLICIT_PUB_LABEL_RE = re.compile(
+    rf"\b(?:published\s+on|publication\s+date|date\s+of\s+publication|issued\s+on|issue\s+date|release\s+date|released\s+on|notice\s+date|dated)\s*[:.-]?\s*({SingleDateTokenPattern})",
+    re.IGNORECASE,
+)
+
+# Ambiguous partial dates (Month YYYY, MM/YYYY, YYYY-MM, MM/YY) or 2-digit-year numeric dates (DD/MM/YY)
+AMBIGUOUS_DATE_RE = re.compile(
+    r"^(?:"
+    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[-\s,./]+20\d{2}|"
+    r"20\d{2}[-/.](?:0?[1-9]|1[0-2])|"
+    r"(?:0?[1-9]|1[0-2])[-/.]20\d{2}|"
+    r"\d{1,2}[-/.]\d{1,2}(?:[-/.]\d{2})?"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _extract_url_embedded_date(url: str) -> Optional[str]:
+    """
+    Extracts an explicit full calendar date embedded in a notice or document URL filename
+    (e.g. 'tentative_vacancies_24102026.pdf' -> '2026-10-24', 'Notice_2026_06_25.pdf' -> '2026-06-25').
+    Used to detect conflicts when an official listing's createdAt/date disagrees with the linked PDF's date.
+    Never extracts bare years or 2-part advertisement numbers.
+    """
+    if not url:
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    basename = os.path.basename(urllib.parse.unquote(parsed.path or ""))
+    if not basename:
+        return None
+
+    # 1. Compact DDMMYYYY in filename (e.g. _24102026.pdf, -23102026.pdf)
+    for m_compact in re.finditer(
+        r"(?:^|[_\-.])(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])(202\d)(?=[_\-.]|$)",
+        basename,
+    ):
+        d, m, y = int(m_compact.group(1)), int(m_compact.group(2)), int(m_compact.group(3))
+        try:
+            datetime.date(y, m, d)
+            return f"{y:04d}-{m:02d}-{d:02d}"
+        except ValueError:
+            continue
+
+    # 2. Separated YYYY_MM_DD or YYYY-MM-DD in filename
+    for m_iso in re.finditer(
+        r"(?:^|[_\-.])(202\d)[_\-.](0?[1-9]|1[0-2])[_\-.](0?[1-9]|[12]\d|3[01])(?=[_\-.]|$)",
+        basename,
+    ):
+        y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        try:
+            datetime.date(y, m, d)
+            return f"{y:04d}-{m:02d}-{d:02d}"
+        except ValueError:
+            continue
+
+    # 3. Separated DD_MM_YYYY or DD-MM-YYYY in filename
+    for m_dmy in re.finditer(
+        r"(?:^|[_\-.])(0?[1-9]|[12]\d|3[01])[_\-.](0?[1-9]|1[0-2])[_\-.](202\d)(?=[_\-.]|$)",
+        basename,
+    ):
+        d, m, y = int(m_dmy.group(1)), int(m_dmy.group(2)), int(m_dmy.group(3))
+        try:
+            datetime.date(y, m, d)
+            return f"{y:04d}-{m:02d}-{d:02d}"
+        except ValueError:
+            continue
+
+    return None
 
 
 def extract_expiry_date(text: str) -> Optional[str]:
@@ -1135,7 +1328,7 @@ def extract_application_date(text: str) -> Optional[str]:
                 return f"{d1} to {d2}"
             return d1
     exp_match = re.search(
-        rf"\b(?:last\s+date(?:\s+(?:for|of|to)\s+(?:apply|online\s+application|submission|registration|fee\s+payment))?|closing\s+date(?:\s+of\s+application)?|apply\s+(?:online\s+)?(?:up\s*to|till|before|by))\s*[:.-]?\s*({SingleDateTokenPattern})",
+        rf"(?:\b(?:last\s+date(?:\s+(?:for|of|to)\s+(?:apply|online\s+application|submission|registration|fee\s+payment))?|closing\s+date(?:\s+of\s+application)?|apply\s+(?:online\s+)?(?:up\s*to|till|before|by))|(?:अंतिम\s+तिथि))\s*[:.-]?\s*({SingleDateTokenPattern})",
         cleaned,
         re.IGNORECASE,
     )
@@ -1157,7 +1350,7 @@ def extract_exam_date(text: str) -> Optional[str]:
     match = EXAM_DATE_CLAUSE_RE.search(cleaned)
     if match:
         d1 = match.group(1).strip()
-        d2 = (match.group(2) or "").strip()
+        d2 = (win_group2 := (match.group(2) or "").strip())
         if parse_publication_date_sort_key(d1) is not None:
             if d2 and parse_publication_date_sort_key(d2) is not None:
                 return f"{d1} to {d2}"
@@ -1168,11 +1361,11 @@ def extract_exam_date(text: str) -> Optional[str]:
 def is_notice_expired(
     text: str = "",
     end_date: Optional[str] = None,
-    reference_date: Optional[datetime.date] = None,
+    reference_date: Optional[Any] = None,
 ) -> bool:
     """
     Returns True if the notice has an explicit expiry/closing date that is
-    strictly in the past relative to reference_date (defaults to today in UTC).
+    strictly in the past relative to reference_date (defaults to today in Asia/Kolkata).
     """
     raw_exp = end_date or extract_expiry_date(text)
     if not raw_exp:
@@ -1180,27 +1373,38 @@ def is_notice_expired(
     exp_key = parse_publication_date_sort_key(raw_exp)
     if exp_key is None:
         return False
-    ref = reference_date or datetime.datetime.now(datetime.timezone.utc).date()
+    ref = ist_today(reference_date)
     return datetime.date(*exp_key) < ref
 
 
 def extract_explicit_date(text: str) -> Optional[str]:
     """
     Extracts an explicit official publication date if present in text, strictly
-    ignoring modified dates ('Last modified ...', 'Updated on ...'), application
-    deadlines/windows ('Visible upto ...', 'Last date ...', 'Closing date ...',
+    ignoring modified dates ('Last modified ...', 'Updated on ...', '<lastmod>'),
+    application deadlines/windows ('Visible upto ...', 'Last date ...', 'Closing date ...',
     'Apply online from ...'), and examination event dates ('Exam Date: ...',
     'to be held on ...').
     Never invents or infers dates from the current scrape timestamp.
     """
     if not text:
         return None
-    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = SITEMAP_LASTMOD_TAG_RE.sub(" ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     # Strip modified dates, application windows, expiry/closing dates, and exam dates
     cleaned = MODIFIED_DATE_CLAUSE_RE.sub(" ", cleaned)
     cleaned = APPLICATION_WINDOW_CLAUSE_RE.sub(" ", cleaned)
     cleaned = EXPIRY_DATE_CLAUSE_RE.sub(" ", cleaned)
     cleaned = EXAM_DATE_CLAUSE_RE.sub(" ", cleaned)
+
+    # Check if text is an ISO-8601 timestamp with time & timezone (e.g. 2026-10-23T16:59:45.637Z)
+    m_full_iso = re.match(
+        r"^(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))$",
+        cleaned,
+    )
+    if m_full_iso:
+        sort_key = parse_publication_date_sort_key(m_full_iso.group(1))
+        if sort_key is not None:
+            return f"{sort_key[0]:04d}-{sort_key[1]:02d}-{sort_key[2]:02d}"
 
     for m in ANY_DATE_LIKE_TOKEN_RE.finditer(cleaned):
         candidate = m.group(1).strip()
@@ -1211,15 +1415,48 @@ def extract_explicit_date(text: str) -> Optional[str]:
 
 def parse_publication_date_sort_key(date_str: Optional[str]) -> Optional[Tuple[int, int, int]]:
     """
-    Parses an explicit date string into a validated (year, month, day) tuple.
-    Returns None if missing, unparseable, or an impossible calendar date (e.g. 31-02-2026).
-    Never substitutes current time.
+    Parses an explicit date string into a validated (year, month, day) tuple in Asia/Kolkata.
+    - When date_str is a timezone-aware ISO-8601 datetime (e.g. '2026-10-23T18:45:00Z' or
+      '2026-10-23T23:50:00+05:30'), converts it to Asia/Kolkata (UTC+05:30) before extracting
+      (year, month, day).
+    - Returns None if missing, unparseable, ambiguous, or an impossible calendar date (e.g. 31-02-2026).
+    - Never substitutes current time.
     """
     if not date_str:
         return None
-    s = date_str.strip()
-    # 1. ISO YYYY-MM-DD (including trailing ISO timestamp e.g. 2026-10-18T10:00:00Z)
-    m_iso = re.match(r"^(20\d{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])(?:[T\s].*)?$", s)
+    s = str(date_str).strip()
+    if not s:
+        return None
+
+    # 0. Full ISO-8601 datetime with timezone (Z or +/-HH:MM) -> convert to Asia/Kolkata calendar date
+    m_iso_tz = re.match(
+        r"^(20\d{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])[T\s](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})$",
+        s,
+        re.IGNORECASE,
+    )
+    if m_iso_tz:
+        try:
+            y, mo, d = int(m_iso_tz.group(1)), int(m_iso_tz.group(2)), int(m_iso_tz.group(3))
+            hh, mm, ss = int(m_iso_tz.group(4)), int(m_iso_tz.group(5)), int(m_iso_tz.group(6))
+            tz_raw = m_iso_tz.group(8).upper()
+            if tz_raw == "Z":
+                tz_info: datetime.tzinfo = datetime.timezone.utc
+            else:
+                sign = -1 if tz_raw.startswith("-") else 1
+                clean_tz = tz_raw[1:].replace(":", "")
+                tz_h = int(clean_tz[:2])
+                tz_m = int(clean_tz[2:4]) if len(clean_tz) >= 4 else 0
+                tz_info = datetime.timezone(
+                    datetime.timedelta(hours=sign * tz_h, minutes=sign * tz_m)
+                )
+            dt_aware = datetime.datetime(y, mo, d, hh, mm, ss, tzinfo=tz_info)
+            dt_ist = dt_aware.astimezone(IST_TIMEZONE)
+            return (dt_ist.year, dt_ist.month, dt_ist.day)
+        except ValueError:
+            return None
+
+    # 1. ISO YYYY-MM-DD (including naive trailing ISO timestamp e.g. 2026-10-18T10:00:00)
+    m_iso = re.match(r"^(20\d{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?$", s)
     if m_iso:
         y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
         try:
@@ -1275,7 +1512,7 @@ def parse_publication_date_sort_key(date_str: Optional[str]) -> Optional[Tuple[i
 
 
 def format_canonical_date(date_str: Optional[str]) -> Optional[str]:
-    """Formats a valid publication date string as YYYY-MM-DD, or returns None if invalid."""
+    """Formats a valid publication date string as YYYY-MM-DD in Asia/Kolkata, or returns None if invalid."""
     key = parse_publication_date_sort_key(date_str)
     if key is None:
         return None
@@ -1284,17 +1521,22 @@ def format_canonical_date(date_str: Optional[str]) -> Optional[str]:
 
 def validate_publication_date(
     pub_date_str: Optional[str],
-    reference_date: Optional[datetime.date] = None,
+    reference_date: Optional[Any] = None,
     max_age_days: int = DEFAULT_MAX_NOTICE_AGE_DAYS,
     allow_future_validated: bool = False,
     context_text: str = "",
+    url: str = "",
 ) -> Tuple[bool, Optional[str], str]:
     """
-    Mandatory publication-date validator for production alerts:
+    Mandatory publication-date validator for production alerts (Asia/Kolkata):
     - Rejects missing or empty publication dates ('MISSING_PUBLICATION_DATE')
-    - Rejects invalid or impossible calendar dates like 31-02-2026 ('INVALID_PUBLICATION_DATE')
+    - Rejects modified/lastmod/deadline/exam/scrape date strings ('NON_PUBLICATION_DATE_TYPE')
+    - Rejects ambiguous partial or 2-digit-year dates ('AMBIGUOUS_PUBLICATION_DATE')
+    - Rejects conflicting publication dates across raw date, context_text, or URL filename ('CONFLICTING_PUBLICATION_DATES')
+    - Rejects invalid or impossible calendar dates like 31-02-2026 or 99/99/2026 ('INVALID_PUBLICATION_DATE')
     - Rejects future publication dates unless explicitly validated ('FUTURE_PUBLICATION_DATE')
-    - Rejects notices older than `max_age_days` ('STALE_PUBLICATION_DATE')
+    - Rejects notices older than `max_age_days` in Asia/Kolkata; with default max_age_days=0,
+      strictly rejects yesterday's and all historical notices ('STALE_PUBLICATION_DATE')
 
     Returns: (is_valid, canonical_iso_date, status_reason)
     """
@@ -1302,13 +1544,27 @@ def validate_publication_date(
         return False, None, "MISSING_PUBLICATION_DATE"
 
     raw = str(pub_date_str).strip()
-    # Ensure the string isn't actually a labelled deadline/modified/exam date string
+    # Ensure the string isn't actually a labelled deadline/modified/lastmod/exam date string
     if (
-        MODIFIED_DATE_CLAUSE_RE.search(raw)
+        SITEMAP_LASTMOD_TAG_RE.search(raw)
+        or MODIFIED_DATE_CLAUSE_RE.search(raw)
         or EXPIRY_DATE_CLAUSE_RE.search(raw)
         or EXAM_DATE_CLAUSE_RE.search(raw)
+        or APPLICATION_WINDOW_CLAUSE_RE.search(raw)
     ):
         return False, None, "NON_PUBLICATION_DATE_TYPE"
+
+    # Check if raw string itself contains multiple distinct calendar dates (e.g. '23-10-2026 / 24-10-2026')
+    raw_tokens = [m.group(1).strip() for m in ANY_DATE_LIKE_TOKEN_RE.finditer(raw)]
+    if len(raw_tokens) > 1:
+        parsed_raw_keys = {
+            k for tok in raw_tokens if (k := parse_publication_date_sort_key(tok)) is not None
+        }
+        if len(parsed_raw_keys) > 1:
+            return False, None, "CONFLICTING_PUBLICATION_DATES"
+
+    if AMBIGUOUS_DATE_RE.match(raw):
+        return False, None, "AMBIGUOUS_PUBLICATION_DATE"
 
     sort_key = parse_publication_date_sort_key(raw)
     if sort_key is None:
@@ -1321,15 +1577,50 @@ def validate_publication_date(
 
     canonical_iso = f"{pub_date.year:04d}-{pub_date.month:02d}-{pub_date.day:02d}"
 
-    if reference_date is not None:
-        ref = reference_date
-    else:
-        # Use Indian Standard Time (UTC+05:30) date when checking Indian government portals
-        ref = (
-            datetime.datetime.now(datetime.timezone.utc)
-            + datetime.timedelta(hours=5, minutes=30)
-        ).date()
+    # Conflict & provenance check 1: context_text
+    if context_text:
+        has_non_pub_same_date = False
+        for clause_re in (
+            MODIFIED_DATE_CLAUSE_RE,
+            EXPIRY_DATE_CLAUSE_RE,
+            EXAM_DATE_CLAUSE_RE,
+            APPLICATION_WINDOW_CLAUSE_RE,
+        ):
+            for m_np in clause_re.finditer(context_text):
+                for grp in m_np.groups():
+                    if grp and format_canonical_date(grp) == canonical_iso:
+                        has_non_pub_same_date = True
+        for m_lm in SITEMAP_LASTMOD_TAG_RE.finditer(context_text):
+            for m_tok in ANY_DATE_LIKE_TOKEN_RE.finditer(m_lm.group(0)):
+                if format_canonical_date(m_tok.group(1)) == canonical_iso:
+                    has_non_pub_same_date = True
 
+        cleaned_ctx = SITEMAP_LASTMOD_TAG_RE.sub(" ", context_text)
+        cleaned_ctx = MODIFIED_DATE_CLAUSE_RE.sub(" ", cleaned_ctx)
+        cleaned_ctx = APPLICATION_WINDOW_CLAUSE_RE.sub(" ", cleaned_ctx)
+        cleaned_ctx = EXPIRY_DATE_CLAUSE_RE.sub(" ", cleaned_ctx)
+        cleaned_ctx = EXAM_DATE_CLAUSE_RE.sub(" ", cleaned_ctx)
+
+        if has_non_pub_same_date:
+            remaining_dates = {
+                format_canonical_date(m_rem.group(1))
+                for m_rem in ANY_DATE_LIKE_TOKEN_RE.finditer(cleaned_ctx)
+            }
+            if canonical_iso not in remaining_dates:
+                return False, None, "NON_PUBLICATION_DATE_TYPE"
+
+        for m_pub in EXPLICIT_PUB_LABEL_RE.finditer(cleaned_ctx):
+            ctx_cand = format_canonical_date(m_pub.group(1))
+            if ctx_cand and ctx_cand != canonical_iso:
+                return False, canonical_iso, "CONFLICTING_PUBLICATION_DATES"
+
+    # Conflict check 2: Embedded full calendar date in official PDF/notice URL filename
+    if url:
+        url_date = _extract_url_embedded_date(url)
+        if url_date and url_date != canonical_iso:
+            return False, canonical_iso, "CONFLICTING_PUBLICATION_DATES"
+
+    ref = ist_today(reference_date)
     age_days = (ref - pub_date).days
     if age_days < 0 and not allow_future_validated:
         return False, canonical_iso, "FUTURE_PUBLICATION_DATE"
@@ -1852,6 +2143,7 @@ class HttpClient:
         sleep_fn: Callable[[float], None] = time.sleep,
         enable_doh_fallback: bool = True,
     ) -> None:
+        self.timeout = timeout
         self.connect_timeout, self.read_timeout = timeout
         self.max_retries = max_retries
         self.sleep_fn = sleep_fn
@@ -2578,8 +2870,8 @@ def adapter_ssc(source: SourceConfig, client: HttpClient) -> List[DiscoveredNoti
             headline = clean_display_title(str(item.get("headline") or ""))
             if not headline:
                 continue
-            created_at = str(item.get("createdAt") or "")
-            pub_date = extract_explicit_date(created_at) or extract_explicit_date(headline)
+            created_at = str(item.get("createdAt") or "").strip()
+            pub_date = format_canonical_date(created_at) or extract_explicit_date(created_at) or extract_explicit_date(headline)
             source_id_val = str(item.get("id") or "") or None
 
             # Determine official PDF link from attachments or redirectUrl
@@ -2602,6 +2894,7 @@ def adapter_ssc(source: SourceConfig, client: HttpClient) -> List[DiscoveredNoti
                 url=pdf_url,
                 publication_date=pub_date,
                 source_identifier=source_id_val,
+                raw_context=headline,
             )
             if notice.fingerprint not in seen_fp:
                 seen_fp.add(notice.fingerprint)
@@ -3238,7 +3531,56 @@ def create_initial_state() -> Dict[str, Any]:
         "updated_at": now,
         "sources": sources_map,
         "notices": {},
+        "pending_queue": [],
     }
+
+
+def _enrich_notice_record_identity(record: Dict[str, Any]) -> None:
+    """
+    Ensures every notice record in state carries all 5 layered identity fields
+    and delivery-ledger fields for backward and forward compatibility.
+    """
+    sid = str(record.get("source_id") or "")
+    title = str(record.get("title") or "")
+    url = str(record.get("url") or record.get("normalized_url") or "")
+    norm_url = str(record.get("normalized_url") or normalize_url(url))
+    norm_title = str(record.get("normalized_title") or normalize_title(title))
+    s_ident = record.get("source_identifier")
+
+    record["normalized_url"] = norm_url
+    record["normalized_title"] = norm_title
+    if not record.get("canonical_url"):
+        record["canonical_url"] = canonical_url_key(norm_url)
+    if "canonical_pdf_url" not in record or record.get("canonical_pdf_url") is None:
+        record["canonical_pdf_url"] = canonical_pdf_url_key(norm_url)
+    if not record.get("canonical_title"):
+        record["canonical_title"] = canonical_title_key(title)
+    if not record.get("content_hash"):
+        record["content_hash"] = compute_content_hash(
+            source_id=sid,
+            title=title,
+            url=norm_url,
+            source_identifier=s_ident,
+        )
+
+    deliv = record.get("delivery_status", "baselined")
+    if not record.get("ledger_status"):
+        if deliv == "delivered":
+            record["ledger_status"] = "ambiguous" if record.get("ambiguous_delivery") else "sent"
+        elif deliv in ("pending", "failed", "baselined", "claimed", "ambiguous"):
+            record["ledger_status"] = deliv
+        else:
+            record["ledger_status"] = "baselined"
+
+    if "telegram_message_id" not in record:
+        record["telegram_message_id"] = None
+    if not record.get("eligibility_status"):
+        if deliv == "delivered" or record.get("ledger_status") in ("sent", "pending", "claimed"):
+            record["eligibility_status"] = "eligible"
+        elif record.get("filter_reason"):
+            record["eligibility_status"] = f"rejected:{record['filter_reason']}"
+        else:
+            record["eligibility_status"] = "baselined"
 
 
 def validate_state_schema(state: Any) -> Dict[str, Any]:
@@ -3266,6 +3608,9 @@ def validate_state_schema(state: Any) -> Dict[str, Any]:
     if not isinstance(notices, dict):
         raise StateValidationError("State 'notices' must be a JSON object")
 
+    if "pending_queue" not in state or not isinstance(state.get("pending_queue"), list):
+        state["pending_queue"] = []
+
     for fp, record in notices.items():
         if not isinstance(record, dict):
             raise StateValidationError(f"Notice entry {fp!r} must be an object")
@@ -3286,8 +3631,17 @@ def validate_state_schema(state: Any) -> Dict[str, Any]:
         raw_status = record["delivery_status"]
         if raw_status == "sent":
             record["delivery_status"] = "delivered"
+            record.setdefault("ledger_status", "sent")
         elif raw_status == "known":
             record["delivery_status"] = "baselined"
+            record.setdefault("ledger_status", "baselined")
+        elif raw_status == "claimed":
+            record["delivery_status"] = "pending"
+            record["ledger_status"] = "claimed"
+        elif raw_status == "ambiguous":
+            record["delivery_status"] = "delivered"
+            record["ledger_status"] = "ambiguous"
+            record["ambiguous_delivery"] = True
 
         if record["delivery_status"] not in ("baselined", "pending", "delivered", "failed"):
             raise StateValidationError(
@@ -3298,21 +3652,29 @@ def validate_state_schema(state: Any) -> Dict[str, Any]:
             raise StateValidationError(
                 f"Notice entry {fp!r} has invalid test_delivery_status {test_status!r}"
             )
+        _enrich_notice_record_identity(record)
 
-    # v4 State Migration & Backward Compatibility:
+    # State Migration & Backward Compatibility:
     # Safely prune removed sites from active monitoring
     # while strictly preserving all 9 retained sites, their notification history,
     # fingerprints, and existing baseline_completed flags.
     for rem_id in REMOVED_SOURCE_IDS:
         sources.pop(rem_id, None)
 
-    # Prune any historical notice entries belonging to removed sources if present
     pruned_notice_fps = [
         fp for fp, rec in notices.items()
         if rec.get("source_id") in REMOVED_SOURCE_IDS
     ]
     for fp in pruned_notice_fps:
         notices.pop(fp, None)
+
+    # Clean pending_queue so it only references existing pending/failed notices
+    state["pending_queue"] = [
+        fp for fp in state.get("pending_queue", [])
+        if isinstance(fp, str)
+        and fp in notices
+        and notices[fp].get("delivery_status") in ("pending", "failed")
+    ]
 
     # Ensure all 9 configured sources exist in state['sources']
     for src in SOURCES:
@@ -3352,7 +3714,8 @@ def apply_state_retention_policy(
       notices retain all verbose metadata fields.
     - Older 'delivered'/'baselined' records beyond `max_full_records` are compacted
       in-place (retaining fingerprint, source_id, organization, title, normalized_title,
-      normalized_url, first_seen_at, delivery_status) so duplicate protection never
+      normalized_url, canonical_url, canonical_pdf_url, canonical_title, content_hash,
+      first_seen_at, delivery_status, ledger_status) so duplicate protection never
       forgets previously processed notices.
     """
     notices = state.get("notices")
@@ -3387,6 +3750,67 @@ def apply_state_retention_policy(
                 notices.pop(fp, None)
 
     return state
+
+
+def _has_meaningful_state_change(
+    before_state: Optional[Dict[str, Any]],
+    after_state: Dict[str, Any],
+) -> bool:
+    """
+    Returns True if meaningful state changed between before_state and after_state
+    (ignoring volatile per-run check timestamps like updated_at, last_checked_at,
+    last_success_at, and last_seen_at on already known notices).
+    This prevents no-op runs from dirtying git working trees and triggering
+    unnecessary commits every 10 minutes.
+    """
+    if before_state is None:
+        return True
+    if bool(before_state.get("initialized")) != bool(after_state.get("initialized")):
+        return True
+    if list(before_state.get("pending_queue") or []) != list(after_state.get("pending_queue") or []):
+        return True
+
+    b_sources = before_state.get("sources") or {}
+    a_sources = after_state.get("sources") or {}
+    if set(b_sources.keys()) != set(a_sources.keys()):
+        return True
+    for sid, a_src in a_sources.items():
+        b_src = b_sources.get(sid) or {}
+        for k in ("baseline_completed", "baseline_completed_at", "last_status", "last_error"):
+            if b_src.get(k) != a_src.get(k):
+                return True
+
+    b_notices = before_state.get("notices") or {}
+    a_notices = after_state.get("notices") or {}
+    if set(b_notices.keys()) != set(a_notices.keys()):
+        return True
+
+    tracked_notice_keys = (
+        "delivery_status",
+        "ledger_status",
+        "publication_date",
+        "application_date",
+        "exam_date",
+        "category",
+        "source_identifier",
+        "delivered_at",
+        "delivery_attempts",
+        "last_delivery_error",
+        "telegram_message_id",
+        "test_delivery_status",
+        "test_delivered_at",
+        "filter_reason",
+        "eligibility_status",
+    )
+    for fp, a_rec in a_notices.items():
+        b_rec = b_notices.get(fp)
+        if b_rec is None:
+            return True
+        for k in tracked_notice_keys:
+            if b_rec.get(k) != a_rec.get(k):
+                return True
+
+    return False
 
 
 def load_state(state_path: str, allow_init_if_missing: bool = False) -> Dict[str, Any]:
@@ -3457,10 +3881,10 @@ def merge_states(base_state: Dict[str, Any], incoming_state: Dict[str, Any]) -> 
     """
     Losslessly merges two valid state dictionaries during a Git push/rebase conflict:
     - Never discards any notice fingerprint from either state
-    - Preserves 'delivered' and 'baselined' statuses over 'failed'/'pending' so a conflict
-      or stale state file never overwrites newer sent records or triggers duplicate alerts
+    - Preserves 'delivered' ('sent'/'ambiguous') and 'baselined' statuses over 'failed'/'pending'
+      so a conflict or stale state file never overwrites newer sent records or triggers duplicate alerts
     - Promotes stale 'pending' records that predate a source's completed baseline to 'baselined'
-    - Preserves completed baselines across all 12 active sources
+    - Preserves completed baselines across all 9 active sources
     """
     validate_state_schema(base_state)
     validate_state_schema(incoming_state)
@@ -3487,7 +3911,6 @@ def merge_states(base_state: Dict[str, Any], incoming_state: Dict[str, Any]) -> 
         else:
             baseline_at = b_at_base or b_at_inc
 
-        # Prefer latest check metadata from whichever state ran more recently
         chk_base = str(s_base.get("last_checked_at") or "")
         chk_inc = str(s_inc.get("last_checked_at") or "")
         newer = s_inc if chk_inc >= chk_base else s_base
@@ -3510,11 +3933,21 @@ def merge_states(base_state: Dict[str, Any], incoming_state: Dict[str, Any]) -> 
 
     # Merge notices without losing any fingerprint or downgrading delivered/baselined status
     status_priority = {
-        "delivered": 4,
-        "sent": 4,
-        "baselined": 3,
-        "known": 3,
-        "failed": 2,
+        "delivered": 5,
+        "sent": 5,
+        "ambiguous": 5,
+        "baselined": 4,
+        "known": 4,
+        "failed": 3,
+        "claimed": 2,
+        "pending": 1,
+    }
+    ledger_priority = {
+        "sent": 6,
+        "ambiguous": 5,
+        "baselined": 4,
+        "failed": 3,
+        "claimed": 2,
         "pending": 1,
     }
     merged_notices: Dict[str, Any] = merged["notices"]
@@ -3532,6 +3965,16 @@ def merge_states(base_state: Dict[str, Any], incoming_state: Dict[str, Any]) -> 
             else b_status
         )
         base_rec["delivery_status"] = winning_status
+
+        b_ledger = str(base_rec.get("ledger_status") or b_status)
+        i_ledger = str(inc_rec.get("ledger_status") or i_status)
+        winning_ledger = (
+            i_ledger
+            if ledger_priority.get(i_ledger, 0) >= ledger_priority.get(b_ledger, 0)
+            else b_ledger
+        )
+        base_rec["ledger_status"] = winning_ledger
+
         base_rec["first_seen_at"] = min(
             str(base_rec.get("first_seen_at") or utc_now_iso()),
             str(inc_rec.get("first_seen_at") or utc_now_iso()),
@@ -3548,6 +3991,13 @@ def merge_states(base_state: Dict[str, Any], incoming_state: Dict[str, Any]) -> 
             "category",
             "source_identifier",
             "delivered_at",
+            "telegram_message_id",
+            "canonical_url",
+            "canonical_pdf_url",
+            "canonical_title",
+            "content_hash",
+            "eligibility_status",
+            "filter_reason",
         ):
             if not base_rec.get(opt_field) and inc_rec.get(opt_field):
                 base_rec[opt_field] = inc_rec[opt_field]
@@ -3556,7 +4006,7 @@ def merge_states(base_state: Dict[str, Any], incoming_state: Dict[str, Any]) -> 
             int(base_rec.get("delivery_attempts") or 0),
             int(inc_rec.get("delivery_attempts") or 0),
         )
-        if winning_status in ("delivered", "baselined"):
+        if winning_status in ("delivered", "baselined") and winning_ledger != "ambiguous":
             base_rec["last_delivery_error"] = None
         elif inc_rec.get("last_delivery_error"):
             base_rec["last_delivery_error"] = inc_rec["last_delivery_error"]
@@ -3579,7 +4029,20 @@ def merge_states(base_state: Dict[str, Any], incoming_state: Dict[str, Any]) -> 
             first_seen = str(rec.get("first_seen_at") or "")
             if src_meta.get("baseline_completed") and b_at and first_seen and first_seen <= b_at:
                 rec["delivery_status"] = "baselined"
+                rec["ledger_status"] = "baselined"
                 rec["last_delivery_error"] = None
+
+    # Merge pending_queue preserving order
+    combined_queue: List[str] = []
+    for q_fp in list(base_state.get("pending_queue") or []) + list(incoming_state.get("pending_queue") or []):
+        if (
+            isinstance(q_fp, str)
+            and q_fp not in combined_queue
+            and q_fp in merged_notices
+            and merged_notices[q_fp].get("delivery_status") in ("pending", "failed")
+        ):
+            combined_queue.append(q_fp)
+    merged["pending_queue"] = combined_queue
 
     apply_state_retention_policy(merged)
     return validate_state_schema(merged)
@@ -3600,7 +4063,6 @@ def resolve_notice_or_board_url(notice_record: Dict[str, Any]) -> str:
     src_cfg = SOURCE_BY_ID.get(source_id)
 
     if parsed.scheme in ("http", "https") and parsed.netloc:
-        # If the URL is bare homepage root and the source has a dedicated HTML notice board URL, prefer it
         if src_cfg and url.rstrip("/") == src_cfg.homepage_url.rstrip("/"):
             for cand in src_cfg.notice_urls:
                 if "/api/" not in cand.lower():
@@ -3710,8 +4172,8 @@ def format_live_test_summary_message(summary: "RunSummary") -> str:
 class TelegramNotifier:
     """
     Delivers individual notice alerts and live-test summaries via the Telegram Bot API over HTTPS.
-    Never logs credentials, respects Retry-After rate limits, and avoids
-    retrying permanent errors (400, 401, 403, 404).
+    Never logs credentials, respects Retry-After rate limits, records Telegram message_id,
+    and avoids retrying permanent errors (400, 401, 403, 404) or ambiguous post-send timeouts.
     """
 
     def __init__(
@@ -3731,6 +4193,7 @@ class TelegramNotifier:
         self.max_retries = max_retries
         self.timeout = timeout
         self.sleep_fn = sleep_fn
+        self.last_message_id: Optional[int] = None
 
     def send_notice(
         self,
@@ -3747,6 +4210,7 @@ class TelegramNotifier:
         return message_html
 
     def _send_html_message(self, message_html: str) -> None:
+        self.last_message_id = None
         api_url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
         payload = json.dumps(
             {
@@ -3770,9 +4234,24 @@ class TelegramNotifier:
                 parsed = self._parse_response(body)
 
                 if status == 200 and parsed.get("ok") is True:
+                    result_obj = parsed.get("result")
+                    if isinstance(result_obj, dict) and result_obj.get("message_id") is not None:
+                        try:
+                            self.last_message_id = int(result_obj["message_id"])
+                        except (TypeError, ValueError):
+                            self.last_message_id = None
                     # Brief politeness delay to avoid hitting Telegram per-chat rate limits
                     self.sleep_fn(0.35)
                     return
+
+                if status == 200 and not parsed:
+                    # HTTP 200 returned after POST but body was truncated/unparseable JSON:
+                    # Telegram likely accepted the message, so fail closed as ambiguous.
+                    raise TelegramDeliveryError(
+                        "Ambiguous Telegram HTTP 200 response with unparseable JSON body",
+                        permanent=False,
+                        ambiguous=True,
+                    )
 
                 description = str(parsed.get("description") or f"HTTP {status}")
                 description = self._redact(description)
@@ -3888,13 +4367,17 @@ class RunSummary:
     filtered_date_notices: int = 0
     rejected_missing_or_invalid_date_notices: int = 0
     rejected_stale_notices: int = 0
+    duplicate_notices_suppressed: int = 0
     capped_pending_notices: int = 0
     capped_deferred_notices: int = 0
     test_messages_delivered: int = 0
     telegram_deliveries_confirmed: int = 0
     telegram_delivery_failures: int = 0
+    ambiguous_deliveries_flagged: int = 0
     summary_message_delivered: bool = False
     state_persisted: bool = False
+    state_modified: bool = False
+    dry_run: bool = False
     per_source_results: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict)
 
 
@@ -3903,11 +4386,13 @@ def _find_existing_notice_record(
     item: DiscoveredNotice,
 ) -> Optional[Dict[str, Any]]:
     """
-    Finds an existing record in notices_store matching item:
+    Finds an existing record in notices_store matching item using the 5-layer identity system:
     1. Exact SHA-256 fingerprint match
-    2. Same source_id + same non-empty source_identifier
-    3. Same source_id + identical normalized or canonical direct document URL
-    4. Same source_id + identical normalized_title or canonical_title_key where neither has a conflicting document filename
+    2. Same source_id + same non-empty official notice/advertisement/document ID (source_identifier)
+    3. Same source_id + identical canonical direct PDF/document URL or canonical URL
+    4. Same source_id + identical content_hash (where neither has a conflicting PDF filename)
+    5. Same source_id + identical normalized_title or canonical_title (len >= 12) where neither
+       has a conflicting document filename
     """
     direct = notices_store.get(item.fingerprint)
     if direct is not None:
@@ -3915,40 +4400,54 @@ def _find_existing_notice_record(
 
     item_doc_tok = _extract_document_token(item.normalized_url)
     item_is_direct_doc = _is_direct_document_url(item.normalized_url)
-    item_canon_url = canonical_url_key(item.normalized_url)
-    item_canon_title = canonical_title_key(item.title)
+    item_canon_url = item.canonical_url or canonical_url_key(item.normalized_url)
+    item_canon_pdf = item.canonical_pdf_url or canonical_pdf_url_key(item.normalized_url)
+    item_canon_title = item.canonical_title or canonical_title_key(item.title)
+    item_content_hash = item.content_hash
 
     for rec in notices_store.values():
         if rec.get("source_id") != item.source_id:
             continue
+
+        # Layer 2: Official source_identifier match
         rec_sid = rec.get("source_identifier")
         if item.source_identifier and rec_sid:
             if str(rec_sid).strip() == str(item.source_identifier).strip():
                 return rec
             continue
 
+        # Layer 3: Canonical PDF / direct document URL match
         rec_norm_url = str(rec.get("normalized_url") or "")
+        rec_canon_pdf = str(rec.get("canonical_pdf_url") or canonical_pdf_url_key(rec_norm_url))
+        if item_canon_pdf and rec_canon_pdf and item_canon_pdf == rec_canon_pdf:
+            return rec
+
         if item_is_direct_doc and item.normalized_url:
             if rec_norm_url == item.normalized_url:
                 return rec
-            if item_canon_url and canonical_url_key(rec_norm_url) == item_canon_url:
+            rec_canon_url = str(rec.get("canonical_url") or canonical_url_key(rec_norm_url))
+            if item_canon_url and rec_canon_url == item_canon_url:
                 return rec
 
+        # Layer 4: Content hash match (guarded by non-conflicting document token)
+        rec_doc_tok = _extract_document_token(rec_norm_url)
+        has_conflicting_doc = (
+            item_doc_tok is not None
+            and rec_doc_tok is not None
+            and item_doc_tok != rec_doc_tok
+        )
+        if not has_conflicting_doc and item_content_hash and rec.get("content_hash") == item_content_hash:
+            return rec
+
+        # Layer 5: Normalized / canonical title match (guarded by non-conflicting document token)
         rec_title = str(rec.get("title") or "")
         rec_norm_title = str(rec.get("normalized_title") or normalize_title(rec_title))
-        rec_canon_title = canonical_title_key(rec_title)
+        rec_canon_title = str(rec.get("canonical_title") or canonical_title_key(rec_title))
         title_matches = (
             (len(item.normalized_title) >= 12 and rec_norm_title == item.normalized_title)
             or (len(item_canon_title) >= 12 and rec_canon_title == item_canon_title)
         )
-        if title_matches:
-            rec_doc_tok = _extract_document_token(rec_norm_url)
-            if (
-                item_doc_tok is not None
-                and rec_doc_tok is not None
-                and item_doc_tok != rec_doc_tok
-            ):
-                continue
+        if title_matches and not has_conflicting_doc:
             return rec
     return None
 
@@ -3977,29 +4476,20 @@ def _is_historical_or_expired_for_board(
     """
     Determines whether a newly encountered notice on an already-baselined source
     is actually an expired notice or an old historical notice (> max_age_days
-    older than the board's newest dated notice or reference_date).
+    older than the current Asia/Kolkata date or reference_date).
     """
-    board_dates: List[datetime.date] = []
-    for n in discovered_board:
-        k = parse_publication_date_sort_key(n.publication_date)
-        if k is not None:
-            try:
-                board_dates.append(datetime.date(*k))
-            except ValueError:
-                pass
-    newest_board_date = max(board_dates) if board_dates else None
-    effective_ref = reference_date or newest_board_date
+    effective_ref = ist_today(reference_date)
 
     # 1. Explicit expiry date check ('Visible upto ...', 'Valid till ...')
     exp_str = extract_expiry_date(item.raw_context or item.title) or extract_expiry_date(item.title)
     if exp_str:
         exp_key = parse_publication_date_sort_key(exp_str)
-        if exp_key is not None and effective_ref is not None:
+        if exp_key is not None:
             if datetime.date(*exp_key) < effective_ref:
                 return True
 
-    # 2. Publication date significantly older than the board's current notices / reference_date
-    if item.publication_date and effective_ref is not None:
+    # 2. Publication date older than effective_ref by more than max_age_days
+    if item.publication_date:
         pub_key = parse_publication_date_sort_key(item.publication_date)
         if pub_key is not None:
             pub_date = datetime.date(*pub_key)
@@ -4032,6 +4522,37 @@ def _is_failed_record_stale(rec: Dict[str, Any]) -> bool:
     return False
 
 
+def _fetch_single_source(
+    src: SourceConfig,
+    http_client: HttpClient,
+    use_isolated_client: bool,
+) -> Tuple[Optional[List[DiscoveredNotice]], Optional[Exception]]:
+    """
+    Worker function that fetches and deduplicates notices for a single source.
+    When running concurrently against live websites, uses an isolated HttpClient
+    instance per worker thread while preserving custom FakeHttpClient instances in tests.
+    """
+    adapter_fn = ADAPTER_REGISTRY.get(src.adapter_name)
+    if adapter_fn is None:
+        return None, KeyError(f"Missing adapter function {src.adapter_name}")
+
+    worker_client = (
+        HttpClient(
+            timeout=http_client.timeout,
+            max_retries=http_client.max_retries,
+            sleep_fn=http_client.sleep_fn,
+        )
+        if use_isolated_client and type(http_client) is HttpClient
+        else http_client
+    )
+    try:
+        raw_discovered = adapter_fn(src, worker_client)
+        discovered = deduplicate_source_notices(raw_discovered, src)
+        return discovered, None
+    except Exception as exc:
+        return None, exc
+
+
 def run_monitor(
     state_path: str = DEFAULT_STATE_PATH,
     mode: str = "auto",
@@ -4044,9 +4565,13 @@ def run_monitor(
     max_age_days: int = DEFAULT_MAX_NOTICE_AGE_DAYS,
     max_alerts_per_run: int = MAX_PRODUCTION_ALERTS_PER_RUN,
     keyword_categories: Optional[Dict[str, Tuple[str, ...]]] = None,
+    dry_run: bool = False,
+    force_save_state: bool = False,
 ) -> Tuple[RunSummary, Dict[str, Any]]:
     """
     Executes a complete monitoring or live_test pass across configured websites:
+    - Fetches all websites concurrently via ThreadPoolExecutor with bounded per-source timeouts
+      while processing results in deterministic source order
     - Isolates per-website failures so one broken site never stops others
     - Distinguishes valid empty notice boards from unrecognized/broken pages
     - Performs explicit per-source baseline on first successful check (including valid empty boards)
@@ -4057,11 +4582,12 @@ def run_monitor(
       * Sends a final Telegram test summary message
     - In 'monitor'/'auto' mode:
       * Enforces strict keyword filtering across the 5 required job-notice categories
-      * Enforces mandatory publication-date validation (rejects missing, invalid, future, or stale dates)
-      * Deduplicates across URLs, titles, organization IDs, and notice identifiers
-      * Enforces a maximum of `max_alerts_per_run` (default 10) production notifications per run
-      * Marks a notice as delivered ('sent') only after Telegram confirms successful delivery
-    - Saves updated state atomically under an advisory file lock
+      * Enforces mandatory Asia/Kolkata publication-date validation BEFORE queuing AND IMMEDIATELY BEFORE sending
+      * Deduplicates across the 5-layer identity system (ID, canonical URL, canonical PDF URL, content hash, normalized title)
+      * Enforces a maximum of `max_alerts_per_run` (default 10) production notifications per run and persists overflow in `pending_queue`
+      * Claims notices before sending, records `sent`/`delivered` with `telegram_message_id` only after Telegram confirmation,
+        and marks ambiguous post-send timeouts as `ambiguous` (`delivered`) to prevent duplicate resends
+      * Avoids rewriting `data/notice_state.json` on pure no-op runs to eliminate unnecessary Git commits
     """
     if logger is None:
         logger, _ = configure_logging()
@@ -4086,12 +4612,16 @@ def run_monitor(
         lock_file_handle = None
 
     try:
+        state_existed_before = os.path.exists(state_path)
         state = load_state(state_path, allow_init_if_missing=allow_init_if_missing)
+        initial_state_snapshot = copy.deepcopy(state) if state_existed_before else None
+
         is_live_test = mode == "live_test"
         force_baseline = (mode == "baseline") or (mode == "auto" and not state.get("initialized", False))
 
         effective_mode = "live_test" if is_live_test else ("baseline" if force_baseline else "monitor")
-        summary = RunSummary(mode=effective_mode, total_websites=len(sources))
+        summary = RunSummary(mode=effective_mode, total_websites=len(sources), dry_run=dry_run)
+        effective_ist_today = ist_today(reference_date)
 
         if is_live_test:
             logger.info("Running in LIVE_TEST mode (live scraping + [LIVE TEST] Telegram verification + baseline recording).")
@@ -4099,15 +4629,38 @@ def run_monitor(
             logger.info("Running in BASELINE mode (or initial uninitialized state).")
         else:
             logger.info(
-                "Running in MONITOR mode (incremental detection, strict keyword & date validation, max_age_days=%d, max_alerts_per_run=%d).",
+                "Running in MONITOR mode (Asia/Kolkata date=%s, max_age_days=%d, max_alerts_per_run=%d, dry_run=%s).",
+                effective_ist_today.isoformat(),
                 max_age_days,
                 max_alerts_per_run,
+                dry_run,
             )
 
         notices_store: Dict[str, Any] = state["notices"]
         sources_store: Dict[str, Any] = state["sources"]
 
-        # Step 1: Query each website independently with strict failure isolation
+        # Step 1: Fetch all configured sources (concurrently when multiple sources are configured
+        # with the real HttpClient, or sequentially for deterministic custom FakeHttpClient mocks)
+        fetched_by_source: Dict[str, Tuple[Optional[List[DiscoveredNotice]], Optional[Exception]]] = {}
+        use_parallel = len(sources) > 1 and type(http_client) is HttpClient
+        if use_parallel:
+            max_workers = min(len(sources), MAX_CONCURRENT_SOURCES)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(_fetch_single_source, src, http_client, True): src
+                    for src in sources
+                }
+                for fut in concurrent.futures.as_completed(future_map):
+                    src_obj = future_map[fut]
+                    try:
+                        fetched_by_source[src_obj.source_id] = fut.result()
+                    except Exception as exc:
+                        fetched_by_source[src_obj.source_id] = (None, exc)
+        else:
+            for src in sources:
+                fetched_by_source[src.source_id] = _fetch_single_source(src, http_client, False)
+
+        # Process results in deterministic source order
         for src in sources:
             src_state = sources_store.setdefault(
                 src.source_id,
@@ -4143,56 +4696,57 @@ def run_monitor(
                 }
                 continue
 
-            try:
-                raw_discovered = adapter_fn(src, http_client)
-                discovered = deduplicate_source_notices(raw_discovered, src)
-            except SourceFetchError as exc:
-                needs_review = exc.category in REVIEW_REQUIRED_ERROR_CATEGORIES
-                outcome = "REVIEW_REQUIRED" if needs_review else "FETCH_FAILED"
-                logger.warning(
-                    "[%s] %s failed: outcome=%s category=%s detail=%s",
-                    src.source_id,
-                    src.organization,
-                    outcome,
-                    exc.category,
-                    exc.detail,
-                )
-                src_state["last_status"] = "error"
-                src_state["last_error"] = f"{exc.category}: {exc.detail}"
-                summary.failed_websites += 1
-                if needs_review:
+            discovered_opt, fetch_exc = fetched_by_source.get(src.source_id, (None, None))
+            if fetch_exc is not None:
+                if isinstance(fetch_exc, SourceFetchError):
+                    needs_review = fetch_exc.category in REVIEW_REQUIRED_ERROR_CATEGORIES
+                    outcome = "REVIEW_REQUIRED" if needs_review else "FETCH_FAILED"
+                    logger.warning(
+                        "[%s] %s failed: outcome=%s category=%s detail=%s",
+                        src.source_id,
+                        src.organization,
+                        outcome,
+                        fetch_exc.category,
+                        fetch_exc.detail,
+                    )
+                    src_state["last_status"] = "error"
+                    src_state["last_error"] = f"{fetch_exc.category}: {fetch_exc.detail}"
+                    summary.failed_websites += 1
+                    if needs_review:
+                        summary.websites_requiring_review += 1
+                    summary.per_source_results[src.source_id] = {
+                        "status": "error",
+                        "test_outcome": outcome,
+                        "error_category": fetch_exc.category,
+                        "error": fetch_exc.detail,
+                        "discovered": 0,
+                        "new": 0,
+                        "baselined": 0,
+                    }
+                    continue
+                else:
+                    logger.exception(
+                        "[%s] Unexpected adapter error for %s: %s",
+                        src.source_id,
+                        src.organization,
+                        fetch_exc,
+                    )
+                    src_state["last_status"] = "error"
+                    src_state["last_error"] = f"UNEXPECTED_ERROR: {fetch_exc}"
+                    summary.failed_websites += 1
                     summary.websites_requiring_review += 1
-                summary.per_source_results[src.source_id] = {
-                    "status": "error",
-                    "test_outcome": outcome,
-                    "error_category": exc.category,
-                    "error": exc.detail,
-                    "discovered": 0,
-                    "new": 0,
-                    "baselined": 0,
-                }
-                continue
-            except Exception as exc:
-                logger.exception(
-                    "[%s] Unexpected adapter error for %s: %s",
-                    src.source_id,
-                    src.organization,
-                    exc,
-                )
-                src_state["last_status"] = "error"
-                src_state["last_error"] = f"UNEXPECTED_ERROR: {exc}"
-                summary.failed_websites += 1
-                summary.websites_requiring_review += 1
-                summary.per_source_results[src.source_id] = {
-                    "status": "error",
-                    "test_outcome": "REVIEW_REQUIRED",
-                    "error_category": "UNEXPECTED_ERROR",
-                    "error": str(exc),
-                    "discovered": 0,
-                    "new": 0,
-                    "baselined": 0,
-                }
-                continue
+                    summary.per_source_results[src.source_id] = {
+                        "status": "error",
+                        "test_outcome": "REVIEW_REQUIRED",
+                        "error_category": "UNEXPECTED_ERROR",
+                        "error": str(fetch_exc),
+                        "discovered": 0,
+                        "new": 0,
+                        "baselined": 0,
+                    }
+                    continue
+
+            discovered = discovered_opt or []
 
             # Website fetch and structure validation succeeded!
             summary.succeeded_websites += 1
@@ -4227,19 +4781,25 @@ def run_monitor(
                         existing["category"] = item.category
                     if item.source_identifier and not existing.get("source_identifier"):
                         existing["source_identifier"] = item.source_identifier
+                    _enrich_notice_record_identity(existing)
                     # If we are baselining or live-testing, ensure any previously pending item
                     # currently on the board is marked baselined so it won't fire later as a normal alert.
                     if source_needs_baseline and existing.get("delivery_status") == "pending":
                         existing["delivery_status"] = "baselined"
+                        existing["ledger_status"] = "baselined"
                         src_baselined_count += 1
                         summary.baselined_notices += 1
+                    else:
+                        summary.duplicate_notices_suppressed += 1
                     continue
 
                 filter_reason: Optional[str] = None
+                eligibility_status = "baselined"
                 if source_needs_baseline:
                     status_value = "baselined"
+                    eligibility_status = "baselined_initial"
                 else:
-                    # 1. Check board-level expiry / historical age
+                    # 1. Check board-level expiry / historical age in Asia/Kolkata
                     is_expired_or_old = _is_historical_or_expired_for_board(
                         item,
                         discovered,
@@ -4252,17 +4812,19 @@ def run_monitor(
                         item.raw_context or "",
                         categories=active_keywords,
                     )
-                    # 3. Check mandatory publication date validation
+                    # 3. Validation #1 (Before Queuing): Mandatory Asia/Kolkata publication-date validation
                     date_valid, canonical_pub_date, date_reason = validate_publication_date(
                         item.publication_date,
                         reference_date=reference_date,
                         max_age_days=max_age_days,
                         context_text=item.raw_context or item.title,
+                        url=item.url,
                     )
 
                     if not is_relevant:
                         status_value = "baselined"
                         filter_reason = f"IRRELEVANT_KEYWORD:{matched_kw}"
+                        eligibility_status = f"rejected:{filter_reason}"
                         summary.filtered_irrelevant_notices += 1
                         logger.warning(
                             "[%s] Filtered irrelevant notice (reason=%s): %s",
@@ -4272,26 +4834,32 @@ def run_monitor(
                         )
                     elif not date_valid or is_expired_or_old:
                         status_value = "baselined"
-                        filter_reason = f"INVALID_PUBLICATION_DATE:{date_reason if not date_valid else 'EXPIRED_OR_HISTORICAL'}"
+                        effective_date_reason = date_reason if not date_valid else "EXPIRED_OR_HISTORICAL"
+                        filter_reason = f"INVALID_PUBLICATION_DATE:{effective_date_reason}"
+                        eligibility_status = f"rejected:{filter_reason}"
                         summary.filtered_date_notices += 1
                         if not date_valid and date_reason in (
                             "MISSING_PUBLICATION_DATE",
                             "INVALID_PUBLICATION_DATE",
                             "FUTURE_PUBLICATION_DATE",
                             "NON_PUBLICATION_DATE_TYPE",
+                            "AMBIGUOUS_PUBLICATION_DATE",
+                            "CONFLICTING_PUBLICATION_DATES",
                         ):
                             summary.rejected_missing_or_invalid_date_notices += 1
                         else:
                             summary.rejected_stale_notices += 1
                         logger.warning(
-                            "[%s] Filtered notice due to publication-date validation (reason=%s, pub_date=%r): %s",
+                            "[%s] Filtered notice due to publication-date validation (reason=%s, pub_date=%r, ist_today=%s): %s",
                             src.source_id,
                             filter_reason,
                             item.publication_date,
+                            effective_ist_today.isoformat(),
                             item.title[:100],
                         )
                     else:
                         status_value = "pending"
+                        eligibility_status = "eligible"
                         if canonical_pub_date:
                             item.publication_date = canonical_pub_date
                         if matched_cat:
@@ -4303,15 +4871,22 @@ def run_monitor(
                     "organization": item.organization,
                     "title": item.title,
                     "normalized_title": item.normalized_title,
+                    "canonical_title": item.canonical_title,
                     "url": item.url,
                     "normalized_url": item.normalized_url,
+                    "canonical_url": item.canonical_url,
+                    "canonical_pdf_url": item.canonical_pdf_url,
+                    "content_hash": item.content_hash,
                     "publication_date": item.publication_date,
                     "category": item.category,
                     "source_identifier": item.source_identifier,
                     "first_seen_at": utc_now_iso(),
                     "last_seen_at": utc_now_iso(),
                     "delivery_status": status_value,
+                    "ledger_status": status_value,
+                    "eligibility_status": eligibility_status,
                     "delivered_at": None,
+                    "telegram_message_id": None,
                     "delivery_attempts": 0,
                     "last_delivery_error": None,
                 }
@@ -4329,6 +4904,8 @@ def run_monitor(
                 else:
                     src_new_count += 1
                     summary.genuinely_new_notices += 1
+                    if item.fingerprint not in state["pending_queue"]:
+                        state["pending_queue"].append(item.fingerprint)
 
             # Complete source baseline even if a validated notice board genuinely has 0 notices
             if source_needs_baseline and not src_state.get("baseline_completed", False):
@@ -4369,12 +4946,19 @@ def run_monitor(
                 if latest_rec is None:
                     latest_rec = notices_store[latest_notice.fingerprint]
 
-                # Ensure normal delivery_status remains 'baselined' or 'delivered' (never 'pending' or 'failed')
                 if latest_rec.get("delivery_status") not in ("baselined", "delivered"):
                     latest_rec["delivery_status"] = "baselined"
+                    latest_rec["ledger_status"] = "baselined"
 
                 latest_rec["test_delivery_attempts"] = int(latest_rec.get("test_delivery_attempts") or 0) + 1
-                if notifier is None:
+                if dry_run:
+                    test_outcome = "LIVE_TEST_DRY_RUN"
+                    logger.info(
+                        "[%s] [DRY RUN] Would send [LIVE TEST] Telegram message for: %s",
+                        src.source_id,
+                        latest_rec.get("title", "")[:80],
+                    )
+                elif notifier is None:
                     latest_rec["test_delivery_status"] = "failed"
                     latest_rec["last_test_error"] = "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
                     summary.telegram_delivery_failures += 1
@@ -4429,11 +5013,12 @@ def run_monitor(
 
         # Step 2: Handle mode-specific Telegram deliveries
         if is_live_test:
-            # Persist baselined state before sending final summary so state is safe on disk
-            save_state_atomically(state, state_path)
+            if not dry_run:
+                save_state_atomically(state, state_path)
+                summary.state_modified = True
             summary.state_persisted = True
 
-            if notifier is not None and hasattr(notifier, "send_live_test_summary"):
+            if not dry_run and notifier is not None and hasattr(notifier, "send_live_test_summary"):
                 try:
                     notifier.send_live_test_summary(summary)
                     summary.summary_message_delivered = True
@@ -4446,55 +5031,82 @@ def run_monitor(
             for rec in notices_store.values():
                 if rec.get("delivery_status") == "failed" and _is_failed_record_stale(rec):
                     rec["delivery_status"] = "baselined"
+                    rec["ledger_status"] = "baselined"
+                    rec["eligibility_status"] = "rejected:STALE_FAILED_RETRY_EXPIRED"
                     rec["last_delivery_error"] = "Suppressed stale failed notice (retry limit or age window exceeded)"
 
-            # Validate any pre-existing pending/failed records against strict keyword & publication-date rules
-            # and deduplicate across the delivery queue so retries or pre-existing state entries cannot send invalid/duplicate alerts.
+            # Build candidate records from notices_store in deterministic order (prioritizing pending_queue order)
+            queue_order = {fp: idx for idx, fp in enumerate(state.get("pending_queue") or [])}
             candidate_records = [
                 rec
                 for rec in notices_store.values()
                 if rec.get("delivery_status") in ("pending", "failed")
             ]
-            candidate_records.sort(key=lambda r: (r.get("first_seen_at") or "", r.get("fingerprint") or ""))
+            candidate_records.sort(
+                key=lambda r: (
+                    queue_order.get(str(r.get("fingerprint") or ""), 10**9),
+                    str(r.get("first_seen_at") or ""),
+                    str(r.get("fingerprint") or ""),
+                )
+            )
 
-            # Collect already-delivered canonical keys per source to block cross-URL/cross-title duplicate sends
+            # Collect already-delivered/ambiguous canonical keys per source to block cross-URL/cross-title duplicate sends
             delivered_canon_urls: Set[Tuple[str, str]] = set()
+            delivered_canon_pdfs: Set[Tuple[str, str]] = set()
             delivered_canon_titles: Set[Tuple[str, str]] = set()
             delivered_source_ids: Set[Tuple[str, str]] = set()
+            delivered_content_hashes: Set[Tuple[str, str]] = set()
             for rec in notices_store.values():
-                if rec.get("delivery_status") == "delivered":
+                if rec.get("delivery_status") == "delivered" or rec.get("ledger_status") in ("sent", "ambiguous"):
                     sid = str(rec.get("source_id") or "")
-                    c_url = canonical_url_key(str(rec.get("normalized_url") or rec.get("url") or ""))
-                    if _is_direct_document_url(str(rec.get("normalized_url") or "")) and c_url:
+                    rec_norm_url = str(rec.get("normalized_url") or rec.get("url") or "")
+                    c_url = str(rec.get("canonical_url") or canonical_url_key(rec_norm_url))
+                    c_pdf = str(rec.get("canonical_pdf_url") or canonical_pdf_url_key(rec_norm_url))
+                    if _is_direct_document_url(rec_norm_url) and c_url:
                         delivered_canon_urls.add((sid, c_url))
-                    c_title = canonical_title_key(str(rec.get("title") or ""))
+                    if c_pdf:
+                        delivered_canon_pdfs.add((sid, c_pdf))
+                    c_title = str(rec.get("canonical_title") or canonical_title_key(str(rec.get("title") or "")))
                     if len(c_title) >= 12:
                         delivered_canon_titles.add((sid, c_title))
                     s_ident = str(rec.get("source_identifier") or "").strip()
                     if s_ident:
                         delivered_source_ids.add((sid, s_ident))
+                    c_hash = str(rec.get("content_hash") or "").strip()
+                    if c_hash:
+                        delivered_content_hashes.add((sid, c_hash))
 
             pending_records: List[Dict[str, Any]] = []
             for rec in candidate_records:
                 if force_baseline:
                     rec["delivery_status"] = "baselined"
+                    rec["ledger_status"] = "baselined"
+                    rec["eligibility_status"] = "baselined_initial"
                     continue
+                _enrich_notice_record_identity(rec)
                 sid = str(rec.get("source_id") or "")
                 rec_title = str(rec.get("title") or "")
                 rec_pub_date = rec.get("publication_date")
                 rec_norm_url = str(rec.get("normalized_url") or rec.get("url") or "")
-                c_url = canonical_url_key(rec_norm_url)
-                c_title = canonical_title_key(rec_title)
+                c_url = str(rec.get("canonical_url") or canonical_url_key(rec_norm_url))
+                c_pdf = str(rec.get("canonical_pdf_url") or canonical_pdf_url_key(rec_norm_url))
+                c_title = str(rec.get("canonical_title") or canonical_title_key(rec_title))
                 s_ident = str(rec.get("source_identifier") or "").strip()
+                c_hash = str(rec.get("content_hash") or "").strip()
 
-                # Check duplicate against already-delivered notices
+                # Check duplicate against already-delivered/ambiguous notices across all 5 identity layers
                 if (
                     (s_ident and (sid, s_ident) in delivered_source_ids)
+                    or (c_pdf and (sid, c_pdf) in delivered_canon_pdfs)
                     or (_is_direct_document_url(rec_norm_url) and c_url and (sid, c_url) in delivered_canon_urls)
+                    or (c_hash and (sid, c_hash) in delivered_content_hashes)
                     or (len(c_title) >= 12 and (sid, c_title) in delivered_canon_titles)
                 ):
                     rec["delivery_status"] = "baselined"
+                    rec["ledger_status"] = "baselined"
                     rec["filter_reason"] = "DUPLICATE_OF_DELIVERED_NOTICE"
+                    rec["eligibility_status"] = "rejected:DUPLICATE_OF_DELIVERED_NOTICE"
+                    summary.duplicate_notices_suppressed += 1
                     logger.info("[%s] Suppressed duplicate pending notice: %s", sid, rec_title[:80])
                     continue
 
@@ -4503,45 +5115,69 @@ def run_monitor(
                     rec_title,
                     categories=active_keywords,
                 )
+                # Validation #2 (Pre-Send Gate): Re-validate publication date against Asia/Kolkata today
                 d_valid, canon_date, d_reason = validate_publication_date(
                     rec_pub_date,
                     reference_date=reference_date,
                     max_age_days=max_age_days,
                     context_text=rec_title,
+                    url=rec_norm_url,
                 )
                 if not is_rel:
                     rec["delivery_status"] = "baselined"
+                    rec["ledger_status"] = "baselined"
                     rec["filter_reason"] = f"IRRELEVANT_KEYWORD:{matched_kw}"
+                    rec["eligibility_status"] = f"rejected:IRRELEVANT_KEYWORD:{matched_kw}"
                     summary.filtered_irrelevant_notices += 1
                     logger.warning("[%s] Demoted pending notice failing keyword filter (%s): %s", sid, matched_kw, rec_title[:80])
                     continue
                 if not d_valid:
                     rec["delivery_status"] = "baselined"
+                    rec["ledger_status"] = "baselined"
                     rec["filter_reason"] = f"INVALID_PUBLICATION_DATE:{d_reason}"
+                    rec["eligibility_status"] = f"rejected:INVALID_PUBLICATION_DATE:{d_reason}"
                     summary.filtered_date_notices += 1
-                    logger.warning("[%s] Demoted pending notice failing publication-date validation (%s): %s", sid, d_reason, rec_title[:80])
+                    if d_reason in (
+                        "MISSING_PUBLICATION_DATE",
+                        "INVALID_PUBLICATION_DATE",
+                        "FUTURE_PUBLICATION_DATE",
+                        "NON_PUBLICATION_DATE_TYPE",
+                        "AMBIGUOUS_PUBLICATION_DATE",
+                        "CONFLICTING_PUBLICATION_DATES",
+                    ):
+                        summary.rejected_missing_or_invalid_date_notices += 1
+                    else:
+                        summary.rejected_stale_notices += 1
+                    logger.warning("[%s] Demoted pending notice failing pre-send publication-date validation (%s): %s", sid, d_reason, rec_title[:80])
                     continue
 
                 if canon_date:
                     rec["publication_date"] = canon_date
                 if matched_cat and (not rec.get("category") or rec.get("category") == "Official Notice"):
                     rec["category"] = matched_cat
+                rec["eligibility_status"] = "eligible"
 
                 # Reserve in delivered sets so two identical pending notices in the same batch don't both fire
                 if s_ident:
                     delivered_source_ids.add((sid, s_ident))
+                if c_pdf:
+                    delivered_canon_pdfs.add((sid, c_pdf))
                 if _is_direct_document_url(rec_norm_url) and c_url:
                     delivered_canon_urls.add((sid, c_url))
+                if c_hash:
+                    delivered_content_hashes.add((sid, c_hash))
                 if len(c_title) >= 12:
                     delivered_canon_titles.add((sid, c_title))
                 pending_records.append(rec)
 
-            # Enforce maximum production alerts per run (default: 10)
+            # Enforce maximum production alerts per run (default: 10) and persist overflow in pending_queue
+            deferred_records: List[Dict[str, Any]] = []
             if max_alerts_per_run > 0 and len(pending_records) > max_alerts_per_run:
-                summary.capped_pending_notices = len(pending_records) - max_alerts_per_run
+                deferred_records = pending_records[max_alerts_per_run:]
+                summary.capped_pending_notices = len(deferred_records)
                 summary.capped_deferred_notices = summary.capped_pending_notices
                 logger.info(
-                    "Enforcing max_alerts_per_run=%d: delivering %d alerts now and deferring %d remaining pending notices.",
+                    "Enforcing max_alerts_per_run=%d: delivering %d alerts now and deferring %d remaining pending notices in pending_queue.",
                     max_alerts_per_run,
                     max_alerts_per_run,
                     summary.capped_pending_notices,
@@ -4549,7 +5185,15 @@ def run_monitor(
                 pending_records = pending_records[:max_alerts_per_run]
 
             if pending_records and not force_baseline:
-                if notifier is None:
+                if dry_run:
+                    for rec in pending_records:
+                        logger.info(
+                            "[DRY RUN] Would deliver Telegram alert for [%s] (pub_date=%s): %s",
+                            rec.get("source_id"),
+                            rec.get("publication_date"),
+                            rec.get("title", "")[:80],
+                        )
+                elif notifier is None:
                     logger.error(
                         "%d notices are pending Telegram delivery, but TelegramNotifier is not configured.",
                         len(pending_records),
@@ -4557,38 +5201,78 @@ def run_monitor(
                     summary.telegram_delivery_failures += len(pending_records)
                     for rec in pending_records:
                         rec["delivery_status"] = "failed"
+                        rec["ledger_status"] = "failed"
                         rec["delivery_attempts"] = int(rec.get("delivery_attempts", 0)) + 1
                         rec["last_delivery_error"] = "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
                 else:
                     for rec in pending_records:
+                        # Final immediate pre-send publication-date & verified date field check
+                        pre_valid, pre_canon_date, pre_reason = validate_publication_date(
+                            rec.get("publication_date"),
+                            reference_date=reference_date,
+                            max_age_days=max_age_days,
+                            context_text=str(rec.get("title") or ""),
+                            url=str(rec.get("normalized_url") or rec.get("url") or ""),
+                        )
+                        if not pre_valid or not pre_canon_date:
+                            rec["delivery_status"] = "baselined"
+                            rec["ledger_status"] = "baselined"
+                            rec["filter_reason"] = f"PRE_SEND_DATE_REJECTED:{pre_reason}"
+                            rec["eligibility_status"] = f"rejected:PRE_SEND_DATE_REJECTED:{pre_reason}"
+                            summary.filtered_date_notices += 1
+                            logger.warning(
+                                "Blocked notice immediately before Telegram send due to publication-date check (%s): %s",
+                                pre_reason,
+                                rec.get("title", "")[:80],
+                            )
+                            continue
+
+                        rec["publication_date"] = pre_canon_date
+                        # Claim notice in ledger before attempting delivery
+                        rec["ledger_status"] = "claimed"
+                        rec["claimed_at"] = utc_now_iso()
                         rec["delivery_attempts"] = int(rec.get("delivery_attempts", 0)) + 1
                         try:
                             _deliver_notice_with_notifier(notifier, rec, is_live_test=False)
                             rec["delivery_status"] = "delivered"
+                            rec["ledger_status"] = "sent"
                             rec["delivered_at"] = utc_now_iso()
+                            rec["telegram_message_id"] = getattr(notifier, "last_message_id", None)
                             rec["last_delivery_error"] = None
                             summary.telegram_deliveries_confirmed += 1
+                            # Persist state immediately after each confirmed delivery so an interrupted run
+                            # can never resend an already-delivered notice
+                            save_state_atomically(state, state_path)
+                            summary.state_modified = True
                             logger.info(
-                                "Delivered Telegram alert for [%s] %s",
+                                "Delivered Telegram alert for [%s] (pub_date=%s, msg_id=%s) %s",
                                 rec.get("source_id"),
+                                rec.get("publication_date"),
+                                rec.get("telegram_message_id"),
                                 rec.get("title", "")[:80],
                             )
                         except TelegramDeliveryError as exc:
                             if getattr(exc, "ambiguous", False):
                                 # Connection timed out after sending POST; Telegram may have accepted the message.
-                                # Do not retry to prevent duplicate alerts.
+                                # Mark as delivered + ledger_status='ambiguous' and persist immediately to prevent duplicate resends.
                                 rec["delivery_status"] = "delivered"
+                                rec["ledger_status"] = "ambiguous"
+                                rec["ambiguous_delivery"] = True
                                 rec["delivered_at"] = utc_now_iso()
                                 rec["last_delivery_error"] = str(exc)
                                 summary.telegram_delivery_failures += 1
+                                summary.ambiguous_deliveries_flagged += 1
+                                save_state_atomically(state, state_path)
+                                summary.state_modified = True
                                 logger.warning(
-                                    "Ambiguous post-send timeout for [%s] %s: %s (marked delivered to prevent duplicate resend).",
+                                    "Ambiguous post-send timeout for [%s] %s: %s (recorded ledger_status='ambiguous' / delivery_status='delivered' to prevent duplicate resend).",
                                     rec.get("source_id"),
                                     rec.get("title", "")[:80],
                                     exc,
                                 )
                             elif getattr(exc, "permanent", False) or int(rec.get("delivery_attempts", 0)) >= MAX_NOTICE_DELIVERY_ATTEMPTS:
                                 rec["delivery_status"] = "baselined"
+                                rec["ledger_status"] = "baselined"
                                 rec["last_delivery_error"] = str(exc)
                                 summary.telegram_delivery_failures += 1
                                 logger.error(
@@ -4599,6 +5283,7 @@ def run_monitor(
                                 )
                             else:
                                 rec["delivery_status"] = "failed"
+                                rec["ledger_status"] = "failed"
                                 rec["last_delivery_error"] = str(exc)
                                 summary.telegram_delivery_failures += 1
                                 logger.error(
@@ -4608,9 +5293,25 @@ def run_monitor(
                                     exc,
                                 )
 
-            # Step 3: Persist state atomically
-            save_state_atomically(state, state_path)
-            summary.state_persisted = True
+            # Update pending_queue with any remaining pending/failed notices (including deferred overflow)
+            state["pending_queue"] = [
+                str(r.get("fingerprint"))
+                for r in (pending_records + deferred_records)
+                if r.get("delivery_status") in ("pending", "failed") and r.get("fingerprint")
+            ]
+
+            # Step 3: Persist state atomically only if not dry_run and state meaningfully changed (or didn't exist yet)
+            if dry_run:
+                summary.state_persisted = True
+                summary.state_modified = False
+            elif force_save_state or not state_existed_before or _has_meaningful_state_change(initial_state_snapshot, state):
+                save_state_atomically(state, state_path)
+                summary.state_persisted = True
+                summary.state_modified = True
+            else:
+                summary.state_persisted = True
+                summary.state_modified = False
+                logger.info("No meaningful state changes detected; skipping state file rewrite to avoid no-op commit.")
 
         return summary, state
     finally:
@@ -4631,7 +5332,7 @@ def print_run_summary(summary: RunSummary) -> None:
     lines = [
         "",
         "============================================================",
-        f"     GOVERNMENT NOTICE MONITOR RUN SUMMARY ({summary.mode.upper()})",
+        f"     GOVERNMENT NOTICE MONITOR RUN SUMMARY ({summary.mode.upper()}{' - DRY RUN' if summary.dry_run else ''})",
         "============================================================",
         f"Total websites                         : {summary.total_websites}",
         f"Successful website fetches and parsing : {summary.succeeded_websites}",
@@ -4641,13 +5342,18 @@ def print_run_summary(summary: RunSummary) -> None:
         f"Websites requiring adapter review      : {summary.websites_requiring_review}",
         f"Number of notices discovered           : {summary.notices_discovered}",
         f"Number of baselined notices            : {summary.baselined_notices}",
+        f"Duplicate notices suppressed           : {summary.duplicate_notices_suppressed}",
         f"Filtered irrelevant notices            : {summary.filtered_irrelevant_notices}",
         f"Filtered missing/stale date notices    : {summary.filtered_date_notices}",
+        f"  - Rejected missing/invalid/conflict  : {summary.rejected_missing_or_invalid_date_notices}",
+        f"  - Rejected old/stale (before IST day): {summary.rejected_stale_notices}",
         f"Number of genuinely new notices        : {summary.genuinely_new_notices}",
+        f"Deferred pending notices (cap={MAX_PRODUCTION_ALERTS_PER_RUN:<2})     : {summary.capped_deferred_notices}",
         f"Test messages delivered successfully   : {summary.test_messages_delivered}",
         f"Telegram deliveries confirmed          : {summary.telegram_deliveries_confirmed}",
         f"Telegram delivery failures             : {summary.telegram_delivery_failures}",
-        f"State persistence succeeded            : {summary.state_persisted}",
+        f"Ambiguous deliveries flagged           : {summary.ambiguous_deliveries_flagged}",
+        f"State persistence succeeded            : {summary.state_persisted} (modified={summary.state_modified})",
         "------------------------------------------------------------",
         "Per-Source Breakdown:",
     ]
@@ -4713,7 +5419,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--max-age-days",
         type=int,
         default=int(os.environ.get("MAX_NOTICE_AGE_DAYS", str(DEFAULT_MAX_NOTICE_AGE_DAYS))),
-        help=f"Maximum publication age in days for a production alert (default: {DEFAULT_MAX_NOTICE_AGE_DAYS}).",
+        help=f"Maximum publication age in days in Asia/Kolkata for a production alert (default: {DEFAULT_MAX_NOTICE_AGE_DAYS}, same-day IST).",
     )
     parser.add_argument(
         "--max-alerts-per-run",
@@ -4725,6 +5431,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--keywords-file",
         default=os.environ.get("NOTICE_KEYWORDS_FILE", ""),
         help="Optional path to JSON file overriding or extending keyword categories.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run scraping, deduplication, and date/keyword validation without sending Telegram messages or modifying the state file.",
     )
     return parser.parse_args(argv)
 
@@ -4771,16 +5482,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         effective_mode = "baseline" if not state_preview.get("initialized", False) else "monitor"
 
     notifier: Optional[TelegramNotifier] = None
-    if effective_mode in ("monitor", "live_test"):
-        if not bot_token or not chat_id:
-            logger.error(
-                "Missing required environment variables TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID for %s mode.",
-                effective_mode,
-            )
-            return 3
-        notifier = TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
-    elif bot_token and chat_id:
-        notifier = TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
+    if not args.dry_run:
+        if effective_mode in ("monitor", "live_test"):
+            if not bot_token or not chat_id:
+                logger.error(
+                    "Missing required environment variables TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID for %s mode.",
+                    effective_mode,
+                )
+                return 3
+            notifier = TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
+        elif bot_token and chat_id:
+            notifier = TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
 
     keyword_categories = load_keyword_categories(config_path=args.keywords_file or None)
 
@@ -4795,6 +5507,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_age_days=args.max_age_days,
             max_alerts_per_run=args.max_alerts_per_run,
             keyword_categories=keyword_categories,
+            dry_run=args.dry_run,
         )
     except StateValidationError as exc:
         logger.error("State validation/persistence failed: %s", exc)
