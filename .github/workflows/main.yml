@@ -42,6 +42,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
+      - name: Synchronize with latest remote branch state after acquiring concurrency lock
+        run: |
+          # Critical fix for overlapping schedule + cron-job.org workflow_dispatch runs:
+          # GitHub Actions pins GITHUB_SHA when a run is queued, BEFORE it acquires the
+          # concurrency lock. Resetting to origin/${GITHUB_REF_NAME} after checkout ensures
+          # this run always loads the freshest data/notice_state.json committed by any prior run.
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -63,12 +72,20 @@ jobs:
       - name: Run government notice monitor
         id: monitor
         env:
+          TZ: Asia/Kolkata
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_MODE: ${{ inputs.mode || 'auto' }}
         run: |
+          # Ensure state includes any remote commit that landed during dependency setup
+          git fetch origin "${GITHUB_REF_NAME}"
+          if git show "origin/${GITHUB_REF_NAME}:data/notice_state.json" > /tmp/pre_run_remote_state.json 2>/dev/null; then
+            python main.py --merge-state /tmp/pre_run_remote_state.json --state-file data/notice_state.json || true
+            rm -f /tmp/pre_run_remote_state.json
+          fi
+
           set +e
-          python main.py --mode "${RUN_MODE}" --state-file data/notice_state.json
+          python main.py --mode "${RUN_MODE}" --state-file data/notice_state.json --allow-partial-source-failures
           EXIT_CODE=$?
           set -e
           echo "monitor_exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
@@ -82,13 +99,14 @@ jobs:
       - name: Persist and push state updates safely
         id: persist
         env:
+          TZ: Asia/Kolkata
           RUN_MODE: ${{ inputs.mode || 'auto' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           if git diff --quiet -- data/notice_state.json; then
-            echo "No changes in data/notice_state.json; skipping commit."
+            echo "No meaningful changes in data/notice_state.json; skipping commit."
             exit 0
           fi
 
